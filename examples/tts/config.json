@@ -1,0 +1,15 @@
+{
+  "judge": {
+    "model": "gpt-audio-2025-08-28"
+  },
+  "evaluation_criteria": [
+    {
+      "name": "intelligibility",
+      "description": "The spoken text is clearly understandable from the audio. The words match the reference text."
+    },
+    {
+      "name": "pronunciation",
+      "description": "Words are pronounced correctly with proper emphasis and natural-sounding speech."
+    }
+  ]
+}

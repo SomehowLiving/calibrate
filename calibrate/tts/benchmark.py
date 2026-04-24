@@ -58,6 +58,8 @@ async def run(
     debug_count: int = 5,
     overwrite: bool = False,
     max_parallel: int = MAX_PARALLEL_PROVIDERS,
+    judge_model: str = None,
+    judge_criteria: list[dict] = None,
 ) -> dict:
     """
     Run TTS evaluation for multiple providers in parallel and generate a leaderboard.
@@ -73,6 +75,8 @@ async def run(
         debug_count: Number of texts to run in debug mode (default: 5)
         overwrite: Overwrite existing results instead of resuming from checkpoint (default: False)
         max_parallel: Maximum number of providers to run in parallel (default: 2)
+        judge_model: Optional model override for LLM judge
+        judge_criteria: Optional list of evaluation criteria dicts for multi-criteria judging
 
     Returns:
         dict: Results summary with status and output paths
@@ -101,6 +105,8 @@ async def run(
                 debug=debug,
                 debug_count=debug_count,
                 overwrite=overwrite,
+                judge_model=judge_model,
+                judge_criteria=judge_criteria,
             )
             return (provider, result)
 
@@ -179,6 +185,13 @@ async def main():
         action="store_true",
         help="Overwrite existing results instead of resuming from last checkpoint",
     )
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=None,
+        help="Path to optional JSON config file with judge settings (model, prompt)",
+    )
 
     args = parser.parse_args()
 
@@ -207,6 +220,16 @@ async def main():
     print(f"Output: {args.output_dir}")
     print("")
 
+    # Load judge config from optional config file
+    judge_model = None
+    judge_criteria = None
+    if args.config:
+        import json as _json
+        with open(args.config) as _f:
+            _cfg = _json.load(_f)
+        judge_model = _cfg.get("judge", {}).get("model")
+        judge_criteria = _cfg.get("evaluation_criteria")
+
     result = await run(
         input=args.input,
         providers=providers,
@@ -215,6 +238,8 @@ async def main():
         debug=args.debug,
         debug_count=args.debug_count,
         overwrite=args.overwrite,
+        judge_model=judge_model,
+        judge_criteria=judge_criteria,
     )
 
     # Print summary
@@ -233,17 +258,12 @@ async def main():
                 has_errors = True
             else:
                 metrics = provider_result.get("metrics", {})
-                llm_score = metrics.get("llm_judge_score", "N/A")
+                judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
                 ttfb_data = metrics.get("ttfb", {})
-                ttfb_mean = ttfb_data.get("mean", "N/A") if ttfb_data else "N/A"
-                if isinstance(llm_score, float) and isinstance(ttfb_mean, float):
-                    print(
-                        f"  {provider}: LLM Score={llm_score:.2f}, TTFB={ttfb_mean:.3f}s"
-                    )
-                elif isinstance(llm_score, float):
-                    print(f"  {provider}: LLM Score={llm_score:.2f}, TTFB={ttfb_mean}")
-                else:
-                    print(f"  {provider}: LLM Score={llm_score}, TTFB={ttfb_mean}")
+                ttfb_mean = ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"
+                judge_str = ", ".join(f"{k}={v:.2f}" for k, v in judge_scores.items())
+                ttfb_str = f"TTFB={ttfb_mean:.3f}s" if isinstance(ttfb_mean, float) else f"TTFB={ttfb_mean}"
+                print(f"  {provider}: {judge_str}, {ttfb_str}")
 
     print(f"\n\033[92mLeaderboard saved to {result['leaderboard_dir']}\033[0m")
 

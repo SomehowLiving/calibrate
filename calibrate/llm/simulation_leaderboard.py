@@ -69,12 +69,17 @@ def _read_metrics(metrics_path: Path) -> Optional[Dict[str, float]]:
         print(f"[WARN] Could not parse {metrics_path}")
         return None
 
-    # Extract mean values for each metric
+    # Extract mean values for each metric.
+    # Binary metrics are 0-1 fractions → convert to % for chart readability.
+    # Rating metrics are raw scores on the criterion's own scale → keep as-is.
     result: Dict[str, float] = {}
     for metric_name, metric_data in data.items():
         if isinstance(metric_data, dict) and "mean" in metric_data:
-            result[metric_name] = metric_data["mean"] * 100  # Convert to percentage
+            is_rating_metric = metric_data.get("type") == "rating"
+            mean = float(metric_data["mean"])
+            result[metric_name] = mean if is_rating_metric else mean * 100
         elif isinstance(metric_data, (int, float)):
+            # Legacy flat value — assume binary pass-rate
             result[metric_name] = float(metric_data) * 100
 
     return result

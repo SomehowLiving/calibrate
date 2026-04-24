@@ -175,6 +175,96 @@ For agent connection, your agent owns its tools internally — there is no need 
 
 ---
 
+## Judge configuration
+
+By default, response-type test cases are evaluated by a text LLM judge. You can override the judge model via an optional top-level `judge` key:
+
+| Key     | Type   | Description                                                        |
+| ------- | ------ | ------------------------------------------------------------------ |
+| `model` | string | Model used by the LLM judge (default: `gpt-4.1-2025-04-14`)       |
+
+```json
+{
+  "judge": {
+    "model": "gpt-4.1-2025-04-14"
+  }
+}
+```
+
+### Multi-criteria evaluation
+
+By default, each response test case uses a single criterion. You can evaluate multiple dimensions by passing an array of criteria instead of a string:
+
+```json
+{
+  "evaluation": {
+    "type": "response",
+    "criteria": [
+      {
+        "name": "accuracy",
+        "description": "The response is factually correct and relevant"
+      },
+      {
+        "name": "tone",
+        "description": "The response is professional and friendly"
+      }
+    ]
+  }
+}
+```
+
+Each criterion is scored independently by the judge. A test case passes only when **all** binary criteria match.
+
+The single-string format still works for simple cases:
+
+```json
+{
+  "evaluation": {
+    "type": "response",
+    "criteria": "The assistant should politely redirect to store-related topics."
+  }
+}
+```
+
+### Rating criteria (non-binary scoring)
+
+Criteria default to **binary** (pass/fail). For dimensions that are better measured on a scale (fluency, politeness, naturalness), set `type: "rating"` and define the scale:
+
+```json
+{
+  "evaluation": {
+    "type": "response",
+    "criteria": [
+      {
+        "name": "accuracy",
+        "description": "The response is factually correct"
+      },
+      {
+        "name": "tone",
+        "type": "rating",
+        "scale_min": 1,
+        "scale_max": 5,
+        "description": "Rate the tone: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful"
+      }
+    ]
+  }
+}
+```
+
+| Key         | Type    | Description                                                                     |
+| ----------- | ------- | ------------------------------------------------------------------------------- |
+| `type`      | string  | `"binary"` (default) or `"rating"`                                              |
+| `scale_min` | integer | Lowest allowed score (required for rating criteria)                             |
+| `scale_max` | integer | Highest allowed score (required for rating criteria)                            |
+
+Rating criteria are **informational**: they produce a mean score per model in the leaderboard but don't affect the test case's pass/fail flag. Only binary criteria determine pass/fail. Use a binary criterion like `"is the tone rating at least 4?"` if you want to gate on a score.
+
+<Note>
+  The `judge` key is optional. When omitted, the built-in defaults are used.
+</Note>
+
+---
+
 ## Full examples
 
 <AccordionGroup>

@@ -208,6 +208,12 @@ Examples:
         help="Generate leaderboard after evaluation (for single provider)",
     )
     stt_parser.add_argument("-s", "--save-dir", type=str)
+    stt_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to optional JSON config file with judge settings (model, prompt)",
+    )
 
     # ── TTS ───────────────────────────────────────────────────────
     # `calibrate tts` with no args → interactive UI
@@ -236,6 +242,12 @@ Examples:
         help="Generate leaderboard after evaluation (for single provider)",
     )
     tts_parser.add_argument("-s", "--save-dir", type=str)
+    tts_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to optional JSON config file with judge settings (model, prompt)",
+    )
 
     # ── LLM tests ───────────────────────────────────────────────
     # `calibrate llm` with no args → interactive UI
@@ -413,6 +425,8 @@ Examples:
                 argv.append("--overwrite")
             if args.save_dir:
                 argv.extend(["-s", args.save_dir])
+            if args.config:
+                argv.extend(["--config", args.config])
 
             sys.argv = argv
             asyncio.run(stt_benchmark_main())
@@ -434,6 +448,8 @@ Examples:
             argv.extend(["-dc", str(args.debug_count)])
             if args.overwrite:
                 argv.append("--overwrite")
+            if args.config:
+                argv.extend(["--config", args.config])
 
             sys.argv = argv
             asyncio.run(tts_benchmark_main())

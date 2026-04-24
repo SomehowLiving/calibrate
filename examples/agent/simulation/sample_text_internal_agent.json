@@ -57,12 +57,18 @@
       "description": "The agent should call the log_inquiry tool with the correct inquiry_type and order_id when provided by the customer."
     },
     {
-      "name": "response_quality",
-      "description": "The agent should be helpful, polite, and guide the customer through the process."
+      "name": "helpfulness",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Rate helpfulness 1 (unhelpful, confused) to 5 (clearly resolved the customer's need)."
     }
   ],
   "settings": {
     "agent_speaks_first": true,
     "max_turns": 5
+  },
+  "judge": {
+    "model": "gpt-5.2-2025-12-11"
   }
 }

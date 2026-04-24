@@ -1,6 +1,7 @@
 import asyncio
 import argparse
 import uuid
+from collections import defaultdict
 from typing import List, Optional, TYPE_CHECKING
 from loguru import logger
 
@@ -37,7 +38,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
-from calibrate.llm.metrics import test_response_llm_judge
+from calibrate.llm.metrics import test_response_llm_judge, DEFAULT_JUDGE_MODEL
 
 from calibrate.langfuse import observe, langfuse, langfuse_enabled
 
@@ -403,6 +404,7 @@ async def run_test(
     provider: str,
     tools: List[dict[str, str]],
     unique_id: str,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
 ):
     output = await run_inference(
         chat_history=chat_history,
@@ -428,13 +430,34 @@ async def run_test(
         metrics = evaluate_tool_calls(output["tool_calls"], evaluation["tool_calls"])
     elif evaluation["type"] == "response":
         if output["response"]:
+            criteria = evaluation["criteria"]
             result = await test_response_llm_judge(
                 conversation=chat_history,
                 response=output["response"],
-                criteria=evaluation["criteria"],
+                criteria=criteria,
+                model=judge_model,
             )
-            metrics["passed"] = result["match"]
-            metrics["reasoning"] = result["reasoning"]
+            # Handle multi-criteria results (dict keyed by criterion name)
+            if isinstance(criteria, list):
+                from calibrate.judges import is_rating
+
+                metrics["judge_results"] = result
+                # passed = all binary criteria match; rating criteria are informational
+                binary_criteria = [c for c in criteria if not is_rating(c)]
+                metrics["passed"] = all(
+                    result[c["name"]]["match"] for c in binary_criteria
+                )
+                failing = [
+                    c for c in binary_criteria
+                    if not result[c["name"]]["match"]
+                ]
+                if failing:
+                    metrics["reasoning"] = result[failing[0]["name"]]["reasoning"]
+                else:
+                    metrics["reasoning"] = "All criteria passed"
+            else:
+                metrics["passed"] = result["match"]
+                metrics["reasoning"] = result["reasoning"]
         else:
             if output["tool_calls"]:
                 metrics["reasoning"] = (
@@ -476,6 +499,7 @@ async def run_test_external(
     evaluation: dict,
     agent,
     model: Optional[str] = None,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
 ) -> dict:
     """Run a single LLM test case against an external text agent.
 
@@ -504,13 +528,33 @@ async def run_test_external(
         metrics = evaluate_tool_calls(tool_calls, evaluation["tool_calls"])
     elif evaluation["type"] == "response":
         if response:
+            criteria = evaluation["criteria"]
             result = await test_response_llm_judge(
                 conversation=chat_history,
                 response=response,
-                criteria=evaluation["criteria"],
+                criteria=criteria,
+                model=judge_model,
             )
-            metrics["passed"] = result["match"]
-            metrics["reasoning"] = result["reasoning"]
+            # Handle multi-criteria results (dict keyed by criterion name)
+            if isinstance(criteria, list):
+                from calibrate.judges import is_rating
+
+                metrics["judge_results"] = result
+                binary_criteria = [c for c in criteria if not is_rating(c)]
+                metrics["passed"] = all(
+                    result[c["name"]]["match"] for c in binary_criteria
+                )
+                failing = [
+                    c for c in binary_criteria
+                    if not result[c["name"]]["match"]
+                ]
+                if failing:
+                    metrics["reasoning"] = result[failing[0]["name"]]["reasoning"]
+                else:
+                    metrics["reasoning"] = "All criteria passed"
+            else:
+                metrics["passed"] = result["match"]
+                metrics["reasoning"] = result["reasoning"]
         else:
             if tool_calls:
                 metrics["reasoning"] = (
@@ -525,6 +569,80 @@ async def run_test_external(
         "output": {"response": response, "tool_calls": tool_calls},
         "metrics": metrics,
     }
+
+
+def _aggregate_criteria(results: List[dict]) -> dict:
+    """Aggregate per-criterion metrics across test case results.
+
+    Each response-type test case contributes to the totals for the criteria it
+    evaluated. Test cases without criteria (e.g., tool_call type) are skipped.
+
+    Per-criterion output shape depends on the criterion's type:
+    - binary: ``{"type": "binary", "passed": int, "total": int, "pass_rate": float}``
+    - rating: ``{"type": "rating", "mean": float, "min": int, "max": int,
+                  "count": int, "scale_min": int, "scale_max": int}``
+
+    Single-string criteria tests contribute under the key ``"criteria"``
+    as a binary criterion (backward compat).
+    """
+    from calibrate.judges import is_rating
+
+    binary_totals: defaultdict = defaultdict(lambda: {"passed": 0, "total": 0})
+    rating_scores: defaultdict = defaultdict(list)
+    rating_scale: dict = {}
+
+    for result in results:
+        metrics = result.get("metrics", {})
+        evaluation = result.get("test_case", {}).get("evaluation", {})
+
+        if evaluation.get("type") != "response":
+            continue
+
+        judge_results = metrics.get("judge_results")
+        criteria = evaluation.get("criteria")
+
+        if judge_results and isinstance(criteria, list):
+            # Multi-criteria path — branch per criterion type
+            for c in criteria:
+                name = c["name"]
+                crit_data = judge_results.get(name, {})
+                if is_rating(c):
+                    if "score" in crit_data:
+                        rating_scores[name].append(int(crit_data["score"]))
+                        rating_scale[name] = (
+                            int(c["scale_min"]),
+                            int(c["scale_max"]),
+                        )
+                else:
+                    binary_totals[name]["total"] += 1
+                    if crit_data.get("match"):
+                        binary_totals[name]["passed"] += 1
+        elif "reasoning" in metrics:
+            # Single-string criteria path — always binary
+            binary_totals["criteria"]["total"] += 1
+            if metrics.get("passed"):
+                binary_totals["criteria"]["passed"] += 1
+
+    aggregated: dict = {}
+    for name, c in binary_totals.items():
+        aggregated[name] = {
+            "type": "binary",
+            "passed": c["passed"],
+            "total": c["total"],
+            "pass_rate": (c["passed"] / c["total"]) * 100 if c["total"] else 0.0,
+        }
+    for name, scores in rating_scores.items():
+        lo, hi = rating_scale[name]
+        aggregated[name] = {
+            "type": "rating",
+            "mean": float(sum(scores) / len(scores)) if scores else 0.0,
+            "min": min(scores) if scores else 0,
+            "max": max(scores) if scores else 0,
+            "count": len(scores),
+            "scale_min": lo,
+            "scale_max": hi,
+        }
+    return aggregated
 
 
 async def run_model_tests(
@@ -571,6 +689,8 @@ async def run_model_tests(
 
     unique_id = str(uuid.uuid4())
 
+    judge_model = config.get("judge", {}).get("model", DEFAULT_JUDGE_MODEL)
+
     for test_case_index, test_case in enumerate(config["test_cases"]):
         agent_language = test_case.get("settings", {}).get("language", "english")
 
@@ -588,6 +708,7 @@ async def run_model_tests(
             provider=provider,
             tools=config["tools"],
             unique_id=unique_id,
+            judge_model=judge_model,
         )
 
         if result["metrics"]["passed"]:
@@ -625,6 +746,7 @@ async def run_model_tests(
     metrics = {
         "total": total_tests,
         "passed": passed_count,
+        "criteria": _aggregate_criteria(results),
     }
 
     with open(join(model_output_dir, "metrics.json"), "w") as f:

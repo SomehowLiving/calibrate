@@ -35,6 +35,7 @@ from calibrate.stt.metrics import (
     get_llm_judge_score,
     get_string_similarity,
 )
+from calibrate.judges import is_rating, DEFAULT_STT_CRITERIA
 from calibrate.langfuse import (
     create_langfuse_audio_media,
     observe,
@@ -730,6 +731,8 @@ async def run_single_provider_eval(
     debug_count: int,
     ignore_retry: bool,
     overwrite: bool,
+    judge_model: str = None,
+    judge_criteria: list[dict] = None,
 ) -> dict:
     """Run STT evaluation for a single provider."""
     provider_output_dir = join(output_dir, provider)
@@ -853,17 +856,28 @@ async def run_single_provider_eval(
     similarity_results = get_string_similarity(all_gt_transcripts, all_pred_transcripts)
     logger.info(f"String Similarity: {similarity_results['score']}")
 
-    llm_results = await get_llm_judge_score(all_gt_transcripts, all_pred_transcripts)
+    _judge_kwargs = {}
+    if judge_model:
+        _judge_kwargs["model"] = judge_model
+    if judge_criteria:
+        _judge_kwargs["criteria"] = judge_criteria
+    llm_results = await get_llm_judge_score(all_gt_transcripts, all_pred_transcripts, **_judge_kwargs)
     logger.info(f"LLM Judge Score: {llm_results['score']}")
+
+    # Map criterion name → criterion dict (for per-row value extraction)
+    _criteria_by_name = {c["name"]: c for c in (judge_criteria or DEFAULT_STT_CRITERIA)}
 
     metrics_data = {
         "wer": wer_results["score"],
         "string_similarity": similarity_results["score"],
-        "llm_judge_score": llm_results["score"],
     }
+    # Per-criterion aggregate: scalar mean for chart compat, full dict under `_info`
+    for name, score_dict in llm_results["scores"].items():
+        metrics_data[f"{name}_score"] = score_dict["mean"]
+        metrics_data[f"{name}_info"] = score_dict
 
     data = []
-    for _id, gt_text, pred_text, wer, sim, llm in zip(
+    for _id, gt_text, pred_text, wer, sim, llm_row in zip(
         all_ids,
         all_gt_transcripts,
         all_pred_transcripts,
@@ -871,17 +885,22 @@ async def run_single_provider_eval(
         similarity_results["per_row"],
         llm_results["per_row"],
     ):
-        data.append(
-            {
-                "id": _id,
-                "gt": gt_text,
-                "pred": pred_text,
-                "wer": wer,
-                "string_similarity": sim,
-                "llm_judge_score": llm["match"],
-                "llm_judge_reasoning": llm["reasoning"],
-            }
-        )
+        row = {
+            "id": _id,
+            "gt": gt_text,
+            "pred": pred_text,
+            "wer": wer,
+            "string_similarity": sim,
+        }
+        for name in llm_results["criteria_names"]:
+            c = _criteria_by_name[name]
+            crit_result = llm_row[name]
+            if is_rating(c):
+                row[f"{name}_score"] = crit_result["score"]
+            else:
+                row[f"{name}_score"] = bool(crit_result["match"])
+            row[f"{name}_reasoning"] = crit_result["reasoning"]
+        data.append(row)
 
     metrics_save_path = join(provider_output_dir, "metrics.json")
     with open(metrics_save_path, "w") as f:
@@ -1016,8 +1035,10 @@ async def main():
     else:
         metrics = result.get("metrics", {})
         wer = metrics.get("wer", 0)
-        llm_score = metrics.get("llm_judge_score", 0)
-        print(f"  {provider}: WER={wer:.4f}, LLM Score={llm_score:.4f}")
+        # Print all judge score metrics
+        judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+        judge_str = ", ".join(f"{k}={v:.4f}" for k, v in judge_scores.items())
+        print(f"  {provider}: WER={wer:.4f}, {judge_str}")
 
 
 if __name__ == "__main__":

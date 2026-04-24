@@ -79,6 +79,7 @@ class _Simulation:
         agent_speaks_first: bool = True,
         max_turns: int = 50,
         port: int = 8765,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run voice agent simulations with the given configuration.
@@ -144,6 +145,8 @@ class _Simulation:
             config["tts"] = tts.to_dict() if hasattr(tts, "to_dict") else tts
         if llm:
             config["llm"] = llm.to_dict() if hasattr(llm, "to_dict") else llm
+        if judge:
+            config["judge"] = judge
 
         # Mapping from interruption_sensitivity labels to probabilities
         interrupt_sensitivity_map = {
@@ -208,16 +211,30 @@ class _Simulation:
 
             for eval_result in evaluation_results:
                 criterion_name = eval_result["name"]
-                match_value = float(eval_result["match"])
-                metrics_by_criterion[criterion_name].append(match_value)
+                # value works for both binary (0/1) and rating (int score)
+                metrics_by_criterion[criterion_name].append(
+                    float(eval_result["value"])
+                )
 
             if stt_judge and "score" in stt_judge:
                 stt_llm_judge_scores.append(stt_judge["score"])
+
+        # Track criterion types for metrics.json enrichment
+        criterion_types = {}
+        for result in results:
+            if isinstance(result, Exception) or result is None:
+                continue
+            _, evaluation_results, _ = result
+            for eval_result in evaluation_results or []:
+                criterion_types.setdefault(
+                    eval_result["name"], eval_result.get("type", "binary")
+                )
 
         # Compute summary
         metrics_summary = {}
         for criterion_name, values in metrics_by_criterion.items():
             metrics_summary[criterion_name] = {
+                "type": criterion_types.get(criterion_name, "binary"),
                 "mean": float(np.mean(values)),
                 "std": float(np.std(values)),
                 "values": values,
@@ -255,6 +272,7 @@ class _Simulation:
         port: int = 8765,
         agent_speaks_first: bool = True,
         max_turns: int = 50,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run a single voice agent simulation.
@@ -285,6 +303,15 @@ class _Simulation:
             ... ))
         """
         from calibrate.agent.run_simulation import run_simulation as _run_simulation
+        from calibrate.llm.metrics import DEFAULT_SIMULATION_JUDGE_MODEL
+        from calibrate.stt.metrics import DEFAULT_STT_JUDGE_MODEL
+
+        kwargs = {}
+        if judge:
+            if judge.get("model"):
+                kwargs["judge_model"] = judge["model"]
+            if judge.get("stt_model"):
+                kwargs["stt_judge_model"] = judge["stt_model"]
 
         return await _run_simulation(
             system_prompt=system_prompt,
@@ -296,6 +323,7 @@ class _Simulation:
             port=port,
             agent_speaks_first=agent_speaks_first,
             max_turns=max_turns,
+            **kwargs,
         )
 
 

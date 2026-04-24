@@ -68,5 +68,8 @@
   },
   "llm": {
     "model": "google/gemini-3-flash-preview"
+  },
+  "judge": {
+    "model": "gpt-5.2-2025-12-11"
   }
 }

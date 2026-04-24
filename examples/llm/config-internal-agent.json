@@ -41,6 +41,9 @@
       }
     }
   ],
+  "judge": {
+    "model": "gpt-4.1-2025-04-14"
+  },
   "test_cases": [
     {
       "history": [
@@ -118,7 +121,19 @@
       ],
       "evaluation": {
         "type": "response",
-        "criteria": "The assistant should respond helpfully about product availability or ask for more details about what specific laptop the customer is looking for."
+        "criteria": [
+          {
+            "name": "relevance",
+            "description": "The assistant should respond about product availability or ask for more details about the laptop."
+          },
+          {
+            "name": "tone",
+            "type": "rating",
+            "scale_min": 1,
+            "scale_max": 5,
+            "description": "Rate the tone on a 1-5 scale: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful."
+          }
+        ]
       }
     }
   ]

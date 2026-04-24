@@ -82,9 +82,11 @@ class _Tests:
         provider: str,
         run_name: Optional[str] = None,
         agent: Optional["TextAgentConnection"] = None,
+        judge_model: Optional[str] = None,
     ) -> dict:
         """Run tests for a single model (or external agent)."""
         from calibrate.llm.run_tests import run_test as _run_test, run_test_external as _run_test_external
+        from calibrate.llm.metrics import DEFAULT_JUDGE_MODEL
         from calibrate.utils import configure_print_logger, log_and_print
 
         # Create output directory
@@ -124,6 +126,8 @@ class _Tests:
         # Pass model name to agent for benchmark routing; None for single runs.
         agent_model_hint: Optional[str] = model if (agent is not None and model) else None
 
+        _judge_model = judge_model or DEFAULT_JUDGE_MODEL
+
         for test_case_index, test_case in enumerate(test_cases):
             if agent is not None:
                 result = await _run_test_external(
@@ -131,6 +135,7 @@ class _Tests:
                     evaluation=test_case["evaluation"],
                     agent=agent,
                     model=agent_model_hint,
+                    judge_model=_judge_model,
                 )
             else:
                 agent_language = test_case.get("settings", {}).get("language", "english")
@@ -142,6 +147,7 @@ class _Tests:
                     model=model,
                     provider=provider,
                     tools=tools,
+                    judge_model=_judge_model,
                 )
 
             if result["metrics"]["passed"]:
@@ -180,7 +186,12 @@ class _Tests:
         with open(os.path.join(final_output_dir, "results.json"), "w") as f:
             json.dump(results, f, indent=4)
 
-        metrics = {"total": total_tests, "passed": total_passed}
+        from calibrate.llm.run_tests import _aggregate_criteria
+        metrics = {
+            "total": total_tests,
+            "passed": total_passed,
+            "criteria": _aggregate_criteria(results),
+        }
         with open(os.path.join(final_output_dir, "metrics.json"), "w") as f:
             json.dump(metrics, f, indent=4)
 
@@ -204,6 +215,7 @@ class _Tests:
         run_name: Optional[str] = None,
         max_parallel: int = 2,
         agent: Optional["TextAgentConnection"] = None,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run LLM tests with the given configuration.
@@ -227,6 +239,7 @@ class _Tests:
             max_parallel: Maximum number of models to run in parallel (default: 2)
             agent: Optional external agent connection. When provided, routes all
                 test cases to the external agent instead of an internal LLM.
+            judge: Optional dict with 'model' key to override the default LLM judge model.
 
         Returns:
             dict: Results containing test outcomes and metrics for all models
@@ -249,6 +262,7 @@ class _Tests:
             ... ))
         """
         tools = tools or []
+        _judge_model = (judge or {}).get("model")
 
         # External agent benchmark: run once per model, passing model hint in each request
         if agent is not None and models and len(models) > 0:
@@ -265,6 +279,7 @@ class _Tests:
                         provider=provider,
                         run_name=run_name,
                         agent=agent,
+                        judge_model=_judge_model,
                     )
 
             results = await asyncio.gather(*[run_agent_model(m) for m in models])
@@ -282,6 +297,7 @@ class _Tests:
                 provider=provider,
                 run_name=run_name,
                 agent=agent,
+                judge_model=_judge_model,
             )
 
         # If models list is provided, run in parallel
@@ -298,6 +314,7 @@ class _Tests:
                         model=m,
                         provider=provider,
                         run_name=run_name,
+                        judge_model=_judge_model,
                     )
 
             tasks = [run_with_semaphore(m) for m in models]
@@ -329,6 +346,7 @@ class _Tests:
             model=model,
             provider=provider,
             run_name=run_name,
+            judge_model=_judge_model,
         )
 
     @staticmethod
@@ -341,6 +359,7 @@ class _Tests:
         provider: Literal["openai", "openrouter"] = "openrouter",
         run_name: Optional[str] = None,
         agent: Optional["TextAgentConnection"] = None,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run LLM tests for a single model or external agent (no leaderboard).
@@ -367,6 +386,7 @@ class _Tests:
             provider=provider,
             run_name=run_name,
             agent=agent,
+            judge_model=(judge or {}).get("model"),
         )
 
     @staticmethod
@@ -394,6 +414,7 @@ class _Tests:
         model: str,
         provider: str,
         tools: List[dict] = None,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run a single LLM test case.
@@ -405,11 +426,16 @@ class _Tests:
             model: Model name
             provider: LLM provider
             tools: Optional list of tool definitions
+            judge: Optional dict with 'model' key to override the default LLM judge model.
 
         Returns:
             dict: Test result with output and metrics
         """
         from calibrate.llm.run_tests import run_test as _run_test
+
+        kwargs = {}
+        if judge and judge.get("model"):
+            kwargs["judge_model"] = judge["model"]
 
         return await _run_test(
             chat_history=chat_history,
@@ -418,6 +444,7 @@ class _Tests:
             model=model,
             provider=provider,
             tools=tools or [],
+            **kwargs,
         )
 
     @staticmethod
@@ -470,6 +497,7 @@ class _Simulations:
         max_turns: int,
         agent: Optional["TextAgentConnection"] = None,
         _flat_output: bool = False,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """Run simulations for a single model or external agent.
 
@@ -502,6 +530,8 @@ class _Simulations:
                 "max_turns": max_turns,
             },
         }
+        if judge:
+            config["judge"] = judge
 
         # Create a mock args object
         class Args:
@@ -592,6 +622,7 @@ class _Simulations:
         max_turns: int = 50,
         max_parallel_models: int = 2,
         agent: Optional["TextAgentConnection"] = None,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run LLM simulations with the given configuration.
@@ -658,6 +689,7 @@ class _Simulations:
                 agent_speaks_first=agent_speaks_first,
                 max_turns=max_turns,
                 agent=agent,
+                judge=judge,
             )
 
         # If models list is provided, run in parallel
@@ -678,6 +710,7 @@ class _Simulations:
                         parallel=parallel,
                         agent_speaks_first=agent_speaks_first,
                         max_turns=max_turns,
+                        judge=judge,
                     )
 
             tasks = [run_with_semaphore(m) for m in models]
@@ -714,6 +747,7 @@ class _Simulations:
             agent_speaks_first=agent_speaks_first,
             max_turns=max_turns,
             _flat_output=True,
+            judge=judge,
         )
 
     @staticmethod
@@ -730,6 +764,7 @@ class _Simulations:
         agent_speaks_first: bool = True,
         max_turns: int = 50,
         agent: Optional["TextAgentConnection"] = None,
+        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run LLM simulations for a single model or external agent (no leaderboard).
@@ -747,6 +782,7 @@ class _Simulations:
             agent_speaks_first: Whether the agent initiates the conversation (default: True)
             max_turns: Maximum number of assistant turns (default: 50)
             agent: Optional external agent connection.
+            judge: Optional dict with 'model' key to override the default LLM judge model.
 
         Returns:
             dict: Results containing simulation outcomes and metrics
@@ -764,6 +800,7 @@ class _Simulations:
             agent_speaks_first=agent_speaks_first,
             max_turns=max_turns,
             agent=agent,
+            judge=judge,
         )
 
     @staticmethod

@@ -72,6 +72,8 @@ async def run(
     ignore_retry: bool = False,
     overwrite: bool = False,
     max_parallel: int = MAX_PARALLEL_PROVIDERS,
+    judge_model: str = None,
+    judge_criteria: list[dict] = None,
 ) -> dict:
     """
     Run STT evaluation for one or more providers and generate a leaderboard.
@@ -89,6 +91,8 @@ async def run(
         ignore_retry: Skip retry if not all audios are processed
         overwrite: Overwrite existing results instead of resuming from checkpoint (default: False)
         max_parallel: Maximum number of providers to run in parallel (default: 2)
+        judge_model: Optional model override for LLM judge
+        judge_criteria: Optional list of evaluation criteria dicts for multi-criteria judging
 
     Returns:
         dict: Results summary with status and output paths
@@ -119,6 +123,8 @@ async def run(
                 debug_count=debug_count,
                 ignore_retry=ignore_retry,
                 overwrite=overwrite,
+                judge_model=judge_model,
+                judge_criteria=judge_criteria,
             )
             return (provider, result)
 
@@ -215,6 +221,13 @@ async def main():
         type=str,
         help="Directory to save leaderboard results (defaults to output_dir/leaderboard)",
     )
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=None,
+        help="Path to optional JSON config file with judge settings (model, prompt)",
+    )
 
     args = parser.parse_args()
 
@@ -244,6 +257,16 @@ async def main():
     print("")
 
     # Run benchmark
+    # Load judge config from optional config file
+    judge_model = None
+    judge_criteria = None
+    if args.config:
+        import json as _json
+        with open(args.config) as _f:
+            _cfg = _json.load(_f)
+        judge_model = _cfg.get("judge", {}).get("model")
+        judge_criteria = _cfg.get("evaluation_criteria")
+
     result = await run(
         providers=providers,
         language=args.language,
@@ -254,6 +277,8 @@ async def main():
         debug_count=args.debug_count,
         ignore_retry=args.ignore_retry,
         overwrite=args.overwrite,
+        judge_model=judge_model,
+        judge_criteria=judge_criteria,
     )
 
     # Print summary
@@ -273,8 +298,9 @@ async def main():
         else:
             metrics = prov_result.get("metrics", {})
             wer = metrics.get("wer", 0)
-            llm_score = metrics.get("llm_judge_score", 0)
-            print(f"  {provider}: WER={wer:.4f}, LLM Score={llm_score:.4f}")
+            judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+            judge_str = ", ".join(f"{k}={v:.4f}" for k, v in judge_scores.items())
+            print(f"  {provider}: WER={wer:.4f}, {judge_str}")
 
     if has_errors:
         sys.exit(1)

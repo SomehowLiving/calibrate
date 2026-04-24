@@ -52,6 +52,57 @@ Refer to the [sample dataset](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blo
 
 The evaluation runs providers in parallel (max 2 at a time), showing the transcriptions as they are generated.
 
+## Judge configuration
+
+By default, a text LLM judge evaluates whether each transcription matches the reference text semantically. You can customize the judge model and add multiple evaluation criteria by passing an optional config file with `--config`:
+
+```bash
+calibrate stt -p deepgram google -i ./data -o ./out --config config.json
+```
+
+The config file supports:
+
+```json
+{
+  "judge": {
+    "model": "gpt-4.1-2025-04-14"
+  },
+  "evaluation_criteria": [
+    {
+      "name": "semantic_match",
+      "description": "Check whether the values represented by both strings match semantically."
+    },
+    {
+      "name": "completeness",
+      "description": "All information from the source text is present in the transcription."
+    }
+  ]
+}
+```
+
+| Key                   | Type   | Description                                                                 |
+| --------------------- | ------ | --------------------------------------------------------------------------- |
+| `judge.model`         | string | Model used by the LLM judge (default: `gpt-4.1-2025-04-14`)                |
+| `evaluation_criteria` | array  | List of criteria to evaluate. Each criterion has `name` and `description`. |
+
+Each criterion also accepts:
+
+| Key         | Type    | Description                                                            |
+| ----------- | ------- | ---------------------------------------------------------------------- |
+| `type`      | string  | `"binary"` (default) or `"rating"`                                     |
+| `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.              |
+| `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score.             |
+
+Binary criteria produce per-row pass/fail and a mean pass-rate. Rating criteria produce an integer score on your scale and a mean score in the leaderboard.
+
+When multiple criteria are defined, each is scored independently and appears as a separate column in the results and leaderboard.
+
+Refer to the [sample config](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/stt/config.json) for a template.
+
+<Note>
+  The `--config` flag is optional. When omitted, a single built-in criterion evaluates semantic match between source and transcription.
+</Note>
+
 ## Output
 
 Once all the providers have completed, it displays a leaderboard measuring key metrics along with bar charts for better visualization.

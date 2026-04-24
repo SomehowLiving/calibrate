@@ -32,6 +32,7 @@ from calibrate.utils import (
     validate_tts_language,
 )
 from calibrate.tts.metrics import get_tts_llm_judge_score
+from calibrate.judges import is_rating, DEFAULT_TTS_CRITERIA
 from calibrate.langfuse import (
     observe,
     langfuse,
@@ -593,14 +594,13 @@ def validate_tts_input_file(input_path: str) -> tuple[bool, str]:
     return True, ""
 
 
-# Expected columns in results.csv for TTS evaluation
+# Expected base columns in results.csv for TTS evaluation
+# (judge columns are dynamic based on criteria, so only check base columns)
 TTS_RESULTS_COLUMNS = [
     "id",
     "text",
     "audio_path",
     "ttfb",
-    "llm_judge_score",
-    "llm_judge_reasoning",
 ]
 
 
@@ -675,6 +675,8 @@ async def run_single_provider_eval(
     debug: bool,
     debug_count: int,
     overwrite: bool,
+    judge_model: str = None,
+    judge_criteria: list[dict] = None,
 ) -> dict:
     """Run TTS evaluation for a single provider."""
     provider_output_dir = os.path.join(output_dir, provider)
@@ -748,13 +750,22 @@ async def run_single_provider_eval(
 
     # Run LLM judge evaluation
     log_and_print("Running LLM judge evaluation...")
-    llm_judge_results = await get_tts_llm_judge_score(all_audio_paths, all_texts)
+    _judge_kwargs = {}
+    if judge_model:
+        _judge_kwargs["model"] = judge_model
+    if judge_criteria:
+        _judge_kwargs["criteria"] = judge_criteria
+    llm_judge_results = await get_tts_llm_judge_score(all_audio_paths, all_texts, **_judge_kwargs)
     log_and_print(f"LLM Judge Score: {llm_judge_results['score']}")
 
-    # Build metrics data
-    metrics_data = {
-        "llm_judge_score": llm_judge_results["score"],
-    }
+    # Map criterion name → criterion dict (for per-row value extraction)
+    _criteria_by_name = {c["name"]: c for c in (judge_criteria or DEFAULT_TTS_CRITERIA)}
+
+    # Build metrics data — scalar mean per criterion (chart compat) + full info dict
+    metrics_data = {}
+    for name, score_dict in llm_judge_results["scores"].items():
+        metrics_data[f"{name}_score"] = score_dict["mean"]
+        metrics_data[f"{name}_info"] = score_dict
 
     # Add ttfb metrics with mean, std, and values (filter out None/NaN values)
     valid_ttfb = [
@@ -778,23 +789,28 @@ async def run_single_provider_eval(
 
     # Update results CSV with LLM judge scores
     data = []
-    for _id, text, audio_path, ttfb, llm_judge_score in zip(
+    for _id, text, audio_path, ttfb, llm_row in zip(
         all_ids,
         all_texts,
         all_audio_paths,
         all_ttfb,
         llm_judge_results["per_row"],
     ):
-        data.append(
-            {
-                "id": _id,
-                "text": text,
-                "audio_path": audio_path,
-                "ttfb": ttfb,
-                "llm_judge_score": llm_judge_score["match"],
-                "llm_judge_reasoning": llm_judge_score["reasoning"],
-            }
-        )
+        row = {
+            "id": _id,
+            "text": text,
+            "audio_path": audio_path,
+            "ttfb": ttfb,
+        }
+        for name in llm_judge_results["criteria_names"]:
+            c = _criteria_by_name[name]
+            crit_result = llm_row[name]
+            if is_rating(c):
+                row[f"{name}_score"] = crit_result["score"]
+            else:
+                row[f"{name}_score"] = bool(crit_result["match"])
+            row[f"{name}_reasoning"] = crit_result["reasoning"]
+        data.append(row)
 
     pd.DataFrame(data).to_csv(results_csv_path, index=False)
     log_and_print(f"Results saved to: {results_csv_path}")
@@ -909,15 +925,12 @@ async def main():
         print(f"  {provider}: \033[31mError - {result.get('error')}\033[0m")
     else:
         metrics = result.get("metrics", {})
-        llm_score = metrics.get("llm_judge_score", "N/A")
+        judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
         ttfb_data = metrics.get("ttfb", {})
-        ttfb_mean = ttfb_data.get("mean", "N/A") if ttfb_data else "N/A"
-        if isinstance(llm_score, float) and isinstance(ttfb_mean, float):
-            print(f"  {provider}: LLM Score={llm_score:.2f}, TTFB={ttfb_mean:.3f}s")
-        elif isinstance(llm_score, float):
-            print(f"  {provider}: LLM Score={llm_score:.2f}, TTFB={ttfb_mean}")
-        else:
-            print(f"  {provider}: LLM Score={llm_score}, TTFB={ttfb_mean}")
+        ttfb_mean = ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"
+        judge_str = ", ".join(f"{k}={v:.2f}" for k, v in judge_scores.items())
+        ttfb_str = f"TTFB={ttfb_mean:.3f}s" if isinstance(ttfb_mean, float) else f"TTFB={ttfb_mean}"
+        print(f"  {provider}: {judge_str}, {ttfb_str}")
 
 
 if __name__ == "__main__":

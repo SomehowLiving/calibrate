@@ -1,21 +1,24 @@
-from evaluate import load
-from typing import List
-from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-import numpy as np
-import instructor
-from tqdm.asyncio import tqdm_asyncio
-from pydantic import BaseModel, Field
-import base64
-import backoff
-from calibrate.langfuse import (
-    AsyncOpenAI,
-    observe,
-    langfuse,
-    langfuse_enabled,
-    create_langfuse_audio_media,
-)
+"""
+TTS evaluation metrics.
+"""
 
-normalizer = BasicTextNormalizer()
+from typing import List, Optional
+
+import numpy as np
+from tqdm.asyncio import tqdm_asyncio
+import backoff
+
+from calibrate.judges import (
+    audio_judge,
+    is_rating,
+    criterion_result_value,
+    DEFAULT_AUDIO_JUDGE_MODEL,
+    DEFAULT_TTS_CRITERIA,
+)
+from calibrate.langfuse import observe
+
+# Re-export for existing imports
+DEFAULT_TTS_JUDGE_MODEL = DEFAULT_AUDIO_JUDGE_MODEL
 
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5, factor=2)
@@ -24,86 +27,90 @@ normalizer = BasicTextNormalizer()
     capture_input=False,
     capture_output=False,
 )
-async def tts_llm_judge(audio_path: str, reference_text: str) -> float:
-    client = instructor.apatch(AsyncOpenAI())
-    # client = instructor.from_provider("openai/gpt-4o-audio-preview", async_client=True)
+async def tts_llm_judge(
+    audio_path: str,
+    reference_text: str,
+    model: str = DEFAULT_TTS_JUDGE_MODEL,
+    criteria: Optional[List[dict]] = None,
+) -> dict:
+    """Evaluate a TTS audio output against one or more criteria.
 
-    class Output(BaseModel):
-        reasoning: str = Field(
-            ...,
-            description="Step-by-step analysis of what is said in the audio and how it compares with the given text.",
-        )
-        match: bool = Field(
-            ..., description="Indicates whether the audio matches the provided text."
-        )
+    Args:
+        audio_path: Path to the synthesized WAV audio file.
+        reference_text: The text that should have been spoken.
+        model: Judge model to use (must be audio-capable).
+        criteria: List of {"name", "description"} dicts. Defaults to DEFAULT_TTS_CRITERIA.
 
-    system_prompt = """You are a highly accurate evaluator evaluating the audio output of a TTs model.\n\nYou will be given the audio and the text that should have been spoken in the audio.\n\nYou need to evaluate if the text is easily understandable from the audio."""
+    Returns:
+        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
+    """
+    criteria_list = criteria if criteria else DEFAULT_TTS_CRITERIA
 
-    response = await client.chat.completions.create(
-        model="gpt-audio-2025-08-28",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Reference text: {reference_text}\n\nAudio:",
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": base64.b64encode(
-                                open(audio_path, "rb").read()
-                            ).decode("utf-8"),
-                            "format": "wav",
-                        },
-                    },
-                ],
-            },
-        ],
-        response_model=Output,
-        modalities=["text"],
-        temperature=0,
-        max_completion_tokens=8192,
-        top_p=1,
-        frequency_penalty=0,
-        presence_penalty=0,
-        store=True,
+    return await audio_judge(
+        criteria=criteria_list,
+        audio_path=audio_path,
+        reference_text=reference_text,
+        model=model,
     )
-
-    response = response.model_dump()
-
-    if langfuse_enabled and langfuse:
-        audio_media = create_langfuse_audio_media(audio_path)
-        langfuse.update_current_trace(
-            input={"audio": audio_media, "reference_text": reference_text},
-            output=response,
-            metadata={
-                "input": f"Reference text: {reference_text}",
-                "output": response,
-                "system_prompt": system_prompt,
-                "output_schema": Output.model_json_schema(),
-            },
-        )
-
-    return response
 
 
 async def get_tts_llm_judge_score(
-    audio_paths: List[str], reference_texts: List[str]
-) -> float:
-    coroutines = []
+    audio_paths: List[str],
+    reference_texts: List[str],
+    model: str = DEFAULT_TTS_JUDGE_MODEL,
+    criteria: Optional[List[dict]] = None,
+) -> dict:
+    """Run TTS judge across all rows and aggregate per-criterion scores.
 
+    Returns:
+        {
+            "criteria_names": ["llm_judge", ...],
+            "scores": {"llm_judge": float, ...},
+            "score": float,  # overall mean (backward compat)
+            "per_row": [
+                {"llm_judge": {"reasoning": ..., "match": ...}, ...},
+                ...
+            ]
+        }
+    """
+    criteria_list = criteria if criteria else DEFAULT_TTS_CRITERIA
+
+    coroutines = []
     for audio_path, reference_text in zip(audio_paths, reference_texts):
-        coroutines.append(tts_llm_judge(audio_path, reference_text))
+        coroutines.append(
+            tts_llm_judge(audio_path, reference_text, model=model, criteria=criteria_list)
+        )
 
     results = await tqdm_asyncio.gather(
         *coroutines,
         desc="Running TTS LLM Judge",
     )
 
+    criteria_names = [c["name"] for c in criteria_list]
+
+    # Aggregate per-criterion scores — binary: mean 0/1, rating: mean score
+    scores: dict = {}
+    for c in criteria_list:
+        name = c["name"]
+        per_row_values = [criterion_result_value(c, row[name]) for row in results]
+        if is_rating(c):
+            scores[name] = {
+                "type": "rating",
+                "mean": float(np.mean(per_row_values)),
+                "scale_min": int(c["scale_min"]),
+                "scale_max": int(c["scale_max"]),
+            }
+        else:
+            scores[name] = {
+                "type": "binary",
+                "mean": float(np.mean(per_row_values)),
+            }
+
+    overall_score = float(np.mean([s["mean"] for s in scores.values()]))
+
     return {
-        "score": np.mean([int(result["match"]) for result in results]),
+        "criteria_names": criteria_names,
+        "scores": scores,
+        "score": overall_score,
         "per_row": results,
     }

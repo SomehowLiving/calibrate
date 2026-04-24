@@ -84,10 +84,13 @@ An array of scenarios that define different conversation patterns to test. For a
 
 An array of LLM judges used to evaluate the agent's performance. Each LLM judge has:
 
-| Key           | Type   | Description                                               |
-| ------------- | ------ | --------------------------------------------------------- |
-| `name`        | string | A short name (used in results)                            |
-| `description` | string | Instructions on how to measure it (used by the LLM judge) |
+| Key           | Type    | Description                                                    |
+| ------------- | ------- | -------------------------------------------------------------- |
+| `name`        | string  | A short name (used in results and leaderboard columns)         |
+| `description` | string  | Instructions on how to measure it (used by the LLM judge)      |
+| `type`        | string  | `"binary"` (default) or `"rating"`                             |
+| `scale_min`   | integer | Required when `type` is `"rating"`. Lowest allowed score.      |
+| `scale_max`   | integer | Required when `type` is `"rating"`. Highest allowed score.     |
 
 ```json
 {
@@ -97,12 +100,17 @@ An array of LLM judges used to evaluate the agent's performance. Each LLM judge 
       "description": "The agent should call the log_inquiry tool with the correct inquiry_type and order_id when provided by the customer."
     },
     {
-      "name": "response_quality",
-      "description": "The agent should be helpful, polite, and guide the customer through the process."
+      "name": "helpfulness",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Rate helpfulness 1 (unhelpful, confused) to 5 (clearly resolved the customer's need)."
     }
   ]
 }
 ```
+
+Binary criteria produce pass/fail and appear as pass-rate percentages in the leaderboard. Rating criteria produce an integer score on the scale you define and appear as mean scores in the leaderboard.
 
 ## Settings
 
@@ -121,6 +129,27 @@ Optional settings to control the simulation:
   }
 }
 ```
+
+## Judge configuration
+
+By default, the evaluation criteria are scored by a text LLM judge. You can override the judge model via an optional top-level `judge` key:
+
+| Key         | Type   | Description                                                                                          |
+| ----------- | ------ | ---------------------------------------------------------------------------------------------------- |
+| `model`     | string | Model used by the evaluation judge (default: `gpt-5.2-2025-12-11`)                                  |
+| `stt_model` | string | Model used by the STT judge in voice simulations (default: `gpt-4.1-2025-04-14`, falls back to `model`) |
+
+```json
+{
+  "judge": {
+    "model": "gpt-5.2-2025-12-11"
+  }
+}
+```
+
+<Note>
+  The `judge` key is optional. When omitted, the built-in defaults are used.
+</Note>
 
 ## STT, LLM, and TTS (voice simulations only)
 

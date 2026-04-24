@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pandas as pd
 
-LEADERBOARD_METRICS = ["wer", "string_similarity", "llm_judge_score"]
 INVALID_SHEET_CHARS = set("[]:*?/\\")
 
 
@@ -51,24 +50,32 @@ def generate_leaderboard(output_dir: str, save_dir: str | None = None) -> str:
         print(f"No provider folders found under {base_path}")
         return str(save_path)
 
+    # Collect all metrics from all providers to build dynamic metric list
+    all_metrics_dicts = []
     summary_rows = []
     run_results = {}
 
     for run_dir in run_dirs:
         metrics = _read_leaderboard_metrics(run_dir / "metrics.json")
+        all_metrics_dicts.append(metrics)
         results_df = _read_leaderboard_results(run_dir / "results.csv")
 
         row = {"run": run_dir.name, "count": len(results_df)}
-        for metric in LEADERBOARD_METRICS:
-            row[metric] = metrics.get(metric)
+        row.update(metrics)
 
         summary_rows.append(row)
         run_results[run_dir.name] = results_df
 
+    # Build dynamic leaderboard metrics from all collected metric keys
+    all_metric_keys = set()
+    for m in all_metrics_dicts:
+        all_metric_keys.update(m.keys())
+    leaderboard_metrics = sorted(all_metric_keys)
+
     summary_df = pd.DataFrame(summary_rows)
 
     if plt is not None:
-        _create_leaderboard_charts(summary_df, save_path, plt)
+        _create_leaderboard_charts(summary_df, save_path, plt, leaderboard_metrics)
     else:
         print("matplotlib not available, skipping chart generation")
 
@@ -91,6 +98,10 @@ def _read_leaderboard_metrics(metrics_path: Path) -> dict:
     metrics = {}
     if isinstance(data, dict) and "metric_name" not in data:
         for key, value in data.items():
+            # Skip `_info` auxiliary keys (full per-criterion dicts) — scalar
+            # `_score` entries carry the display value for the chart/table.
+            if key.endswith("_info"):
+                continue
             if isinstance(value, dict) and "mean" in value:
                 metrics[key] = value["mean"]
             elif isinstance(value, (int, float)):
@@ -121,11 +132,11 @@ def _read_leaderboard_results(results_path: Path) -> pd.DataFrame:
     return pd.read_csv(results_path)
 
 
-def _create_leaderboard_charts(summary_df: pd.DataFrame, output_dir: Path, plt) -> None:
+def _create_leaderboard_charts(summary_df: pd.DataFrame, output_dir: Path, plt, leaderboard_metrics: list[str]) -> None:
     """Create bar charts for each metric."""
     import numpy as np
 
-    available_metrics = [m for m in LEADERBOARD_METRICS if m in summary_df.columns]
+    available_metrics = [m for m in leaderboard_metrics if m in summary_df.columns]
     if not available_metrics:
         print("No metrics available to plot.")
         return

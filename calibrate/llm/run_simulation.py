@@ -46,7 +46,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
-from calibrate.llm.metrics import evaluate_simuation
+from calibrate.llm.metrics import evaluate_simuation, DEFAULT_SIMULATION_JUDGE_MODEL
+from calibrate.judges import criterion_result_value, is_rating
 import pandas as pd
 import numpy as np
 
@@ -258,6 +259,7 @@ async def run_simulation(
     agent_speaks_first: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     output_dir: Optional[str] = None,
+    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
 ) -> List[str]:
     """Runs a text-only bot that processes text inputs through an LLM and returns text outputs."""
     # Create LLM service
@@ -498,13 +500,16 @@ async def run_simulation(
         f"Evaluating the conversation based on the criteria:\n\n{evaluation_criteria}"
     )
     llm_judge_result = await evaluate_simuation(
-        transcript, evaluation_criteria, agent_system_prompt=bot_system_prompt
+        transcript, evaluation_criteria, agent_system_prompt=bot_system_prompt, model=judge_model
     )
 
     evaluation_results = [
         {
             "name": criterion["name"],
-            "value": int(llm_judge_result[criterion["name"]]["match"]),
+            "type": "rating" if is_rating(criterion) else "binary",
+            "value": criterion_result_value(
+                criterion, llm_judge_result[criterion["name"]]
+            ),
             "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
         }
         for criterion in evaluation_criteria
@@ -534,6 +539,7 @@ async def run_simulation_with_agent(
     user_model: str = "gpt-4.1",
     user_provider: str = "openai",
     output_dir: Optional[str] = None,
+    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
 ) -> dict:
     """Run a text simulation where the agent is an external HTTP endpoint.
 
@@ -644,12 +650,15 @@ async def run_simulation_with_agent(
     log_and_print(
         f"Evaluating the conversation based on the criteria:\n\n{evaluation_criteria}"
     )
-    llm_judge_result = await evaluate_simuation(transcript, evaluation_criteria)
+    llm_judge_result = await evaluate_simuation(transcript, evaluation_criteria, model=judge_model)
 
     evaluation_results = [
         {
             "name": criterion["name"],
-            "value": int(llm_judge_result[criterion["name"]]["match"]),
+            "type": "rating" if is_rating(criterion) else "binary",
+            "value": criterion_result_value(
+                criterion, llm_judge_result[criterion["name"]]
+            ),
             "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
         }
         for criterion in evaluation_criteria
@@ -735,6 +744,8 @@ async def run_single_simulation_task(
             log_and_print(f"\033[93mAgent Speaks First:\033[0m {agent_speaks_first}")
             log_and_print("--------------------------------")
 
+            judge_model = config.get("judge", {}).get("model", DEFAULT_SIMULATION_JUDGE_MODEL)
+
             try:
                 if agent is not None:
                     output = await run_simulation_with_agent(
@@ -748,6 +759,7 @@ async def run_single_simulation_task(
                         user_model="gpt-4.1",
                         user_provider="openai",
                         output_dir=simulation_output_dir,
+                        judge_model=judge_model,
                     )
                 else:
                     output = await run_simulation(
@@ -765,6 +777,7 @@ async def run_single_simulation_task(
                             "max_turns", DEFAULT_MAX_TURNS
                         ),
                         output_dir=simulation_output_dir,
+                        judge_model=judge_model,
                     )
 
                 simulation_metrics = {
@@ -909,10 +922,22 @@ async def main():
         for metric_dict in evaluation_results:
             metrics[metric_dict["name"]].append(float(metric_dict["value"]))
 
+    # Track criterion types per metric name (defaults to binary if not marked)
+    criterion_types = {}
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        _, evaluation_results = result
+        for metric_dict in evaluation_results:
+            criterion_types.setdefault(
+                metric_dict["name"], metric_dict.get("type", "binary")
+            )
+
     metrics_summary = {}
 
     for metric_name, metric_values in metrics.items():
         metrics_summary[metric_name] = {
+            "type": criterion_types.get(metric_name, "binary"),
             "mean": np.mean(metric_values),
             "std": np.std(metric_values),
             "values": metric_values,

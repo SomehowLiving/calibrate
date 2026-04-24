@@ -1,14 +1,29 @@
-from evaluate import load
-from typing import List
-from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-import numpy as np
-from tqdm.asyncio import tqdm_asyncio
+"""
+STT evaluation metrics.
+"""
+
+from typing import List, Optional
+
 import difflib
-from calibrate.langfuse import AsyncOpenAI, observe, langfuse, langfuse_enabled
-from pydantic import BaseModel, Field
+import numpy as np
+from evaluate import load
+from tqdm.asyncio import tqdm_asyncio
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 import backoff
 
+from calibrate.judges import (
+    text_judge,
+    is_rating,
+    criterion_result_value,
+    DEFAULT_TEXT_JUDGE_MODEL,
+    DEFAULT_STT_CRITERIA,
+)
+from calibrate.langfuse import observe, langfuse, langfuse_enabled
+
 normalizer = BasicTextNormalizer()
+
+# Re-export for existing imports
+DEFAULT_STT_JUDGE_MODEL = DEFAULT_TEXT_JUDGE_MODEL
 
 
 def get_wer_score(references: List[str], predictions: List[str]) -> float:
@@ -28,14 +43,13 @@ def get_wer_score(references: List[str], predictions: List[str]) -> float:
 def get_string_similarity(references: List[str], predictions: List[str]) -> float:
     similarities = []
 
-    # Use edit distance (Levenshtein distance) to compute similarity between strings
     for reference, prediction in zip(references, predictions):
         seq = difflib.SequenceMatcher(
             None,
             normalizer(str(reference)),
             normalizer(str(prediction)) if isinstance(prediction, str) else "",
         )
-        similarities.append(seq.ratio())  # value between 0 and 1
+        similarities.append(seq.ratio())
 
     return {
         "score": np.mean(similarities),
@@ -48,50 +62,33 @@ def get_string_similarity(references: List[str], predictions: List[str]) -> floa
     name="stt_llm_judge",
     capture_input=False,
 )
-async def stt_llm_judge(reference: str, prediction: str) -> float:
-    client = AsyncOpenAI()
+async def stt_llm_judge(
+    reference: str,
+    prediction: str,
+    model: str = DEFAULT_STT_JUDGE_MODEL,
+    criteria: Optional[List[dict]] = None,
+) -> dict:
+    """Evaluate an STT transcription against one or more criteria.
 
-    class Output(BaseModel):
-        reasoning: str = Field(
-            ...,
-            description="Analyse the inputs on whether they match or not given the guidelines",
-        )
-        match: bool = Field(
-            ..., description="True if the two strings match, otherwise false."
-        )
+    Args:
+        reference: The source/ground-truth text.
+        prediction: The STT transcription output.
+        model: Judge model to use.
+        criteria: List of {"name", "description"} dicts. Defaults to DEFAULT_STT_CRITERIA.
 
-    system_prompt = """You are a highly accurate evaluator evaluating the transcription output of an STT model.
+    Returns:
+        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
+        With default single criterion, returns {"llm_judge": {"reasoning": ..., "match": ...}}.
+    """
+    criteria_list = criteria if criteria else DEFAULT_STT_CRITERIA
 
-You will be given two strings - one is the source string used to produce an audio and the other is the transcription of that audio.
+    user_prompt = f"Source: {reference}\nTranscription: {prediction}"
 
-You need to evaluate if the two strings are the same.
-
-# Important Instructions:
-- Check whether the values represented by both the strings match. E.g. if one string says 1,2,3 but the other string says "one, two, three" or "one, 2, three", they should be considered the same as their underlying value is the same. However, if the actual values itself are different, e.g. for the name of a person or address or the value of any other key detail - that difference should be noted.
-- Ignore differences like a word being split up into more than 1 word by spaces. Look at whether the values mean the same in both the strings.
-- If all the "values" for the strings match, mark it as True. Else, False."""
-
-    user_prompt = f"""Source: {reference}\nTranscription: {prediction}"""
-
-    response = await client.responses.parse(
-        model="gpt-4.1-2025-04-14",
-        input=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        text_format=Output,
-        temperature=0,
-        max_output_tokens=2048,
-        store=True,
+    result = await text_judge(
+        criteria=criteria_list,
+        user_prompt=user_prompt,
+        model=model,
     )
-
-    response = response.output_parsed.model_dump()
 
     if langfuse_enabled and langfuse:
         langfuse.update_current_trace(
@@ -99,25 +96,73 @@ You need to evaluate if the two strings are the same.
             metadata={
                 "reference": reference,
                 "prediction": prediction,
-                "output": response,
+                "output": result,
             },
         )
 
-    return response
+    return result
 
 
-async def get_llm_judge_score(references: List[str], predictions: List[str]) -> float:
+async def get_llm_judge_score(
+    references: List[str],
+    predictions: List[str],
+    model: str = DEFAULT_STT_JUDGE_MODEL,
+    criteria: Optional[List[dict]] = None,
+) -> dict:
+    """Run STT judge across all rows and aggregate per-criterion scores.
+
+    Returns:
+        {
+            "criteria_names": ["llm_judge", ...],
+            "scores": {"llm_judge": float, ...},  # mean match rate per criterion
+            "per_row": [
+                {"llm_judge": {"reasoning": ..., "match": ...}, ...},
+                ...
+            ]
+        }
+    """
+    criteria_list = criteria if criteria else DEFAULT_STT_CRITERIA
+
     coroutines = []
-
     for reference, prediction in zip(references, predictions):
-        coroutines.append(stt_llm_judge(str(reference), str(prediction)))
+        coroutines.append(
+            stt_llm_judge(str(reference), str(prediction), model=model, criteria=criteria_list)
+        )
 
     results = await tqdm_asyncio.gather(
         *coroutines,
         desc="Running STT LLM Judge",
     )
 
+    criteria_names = [c["name"] for c in criteria_list]
+
+    # Aggregate per-criterion scores — mean of 0/1 for binary, mean of scores for rating.
+    # Returns per-criterion aggregate dicts so downstream code can distinguish types.
+    scores: dict = {}
+    for c in criteria_list:
+        name = c["name"]
+        per_row_values = [criterion_result_value(c, row[name]) for row in results]
+        if is_rating(c):
+            scores[name] = {
+                "type": "rating",
+                "mean": float(np.mean(per_row_values)),
+                "scale_min": int(c["scale_min"]),
+                "scale_max": int(c["scale_max"]),
+            }
+        else:
+            scores[name] = {
+                "type": "binary",
+                "mean": float(np.mean(per_row_values)),  # pass-rate fraction 0.0–1.0
+            }
+
+    # Backward compat: top-level "score" = mean across criteria means (same as before
+    # for binary-only configs). Works for mixed configs too, with caveat that rating
+    # means are on a different scale.
+    overall_score = float(np.mean([s["mean"] for s in scores.values()]))
+
     return {
-        "score": np.mean([int(result["match"]) for result in results]),
+        "criteria_names": criteria_names,
+        "scores": scores,
+        "score": overall_score,
         "per_row": results,
     }

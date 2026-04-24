@@ -31,8 +31,9 @@ from calibrate.utils import (
     build_tools_schema,
     make_webhook_call,
 )
-from calibrate.llm.metrics import evaluate_simuation
-from calibrate.stt.metrics import get_llm_judge_score as stt_llm_judge_score
+from calibrate.llm.metrics import evaluate_simuation, DEFAULT_SIMULATION_JUDGE_MODEL
+from calibrate.stt.metrics import get_llm_judge_score as stt_llm_judge_score, DEFAULT_STT_JUDGE_MODEL
+from calibrate.judges import criterion_result_value, is_rating
 import pandas as pd
 
 USER_MESSAGE_COLOR = "\033[94m"
@@ -829,6 +830,8 @@ async def run_simulation(
     agent_speaks_first: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     tools: list[dict] = None,
+    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+    stt_judge_model: str = DEFAULT_STT_JUDGE_MODEL,
 ) -> dict:
     # Set context for EVAL logs
     current_context.set("EVAL")
@@ -871,6 +874,8 @@ async def run_simulation(
             tools=tools,
             captured_errors=captured_errors,
             pipeline_task_ref=_pipeline_task_ref,
+            judge_model=judge_model,
+            stt_judge_model=stt_judge_model,
         )
     finally:
         logger.remove(error_sink_id)
@@ -889,6 +894,8 @@ async def _run_simulation_inner(
     tools: list[dict],
     captured_errors: list[str],
     pipeline_task_ref: list,
+    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+    stt_judge_model: str = DEFAULT_STT_JUDGE_MODEL,
 ) -> dict:
     # Build webhook configs from tools for function call handling
     webhook_configs = {}
@@ -1166,13 +1173,16 @@ async def _run_simulation_inner(
     )
     # Get evaluation results from LLM judge
     llm_judge_result = await evaluate_simuation(
-        transcript, evaluation_criteria, agent_system_prompt=system_prompt
+        transcript, evaluation_criteria, agent_system_prompt=system_prompt, model=judge_model
     )
 
     evaluation_results = [
         {
             "name": criterion["name"],
-            "match": llm_judge_result[criterion["name"]]["match"],
+            "type": "rating" if is_rating(criterion) else "binary",
+            "value": criterion_result_value(
+                criterion, llm_judge_result[criterion["name"]]
+            ),
             "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
         }
         for criterion in evaluation_criteria
@@ -1202,6 +1212,7 @@ async def _run_simulation_inner(
             stt_llm_judge_result = await stt_llm_judge_score(
                 references=stt_eval_references,
                 predictions=stt_eval_predictions,
+                model=stt_judge_model,
             )
 
     # Build comprehensive metrics
@@ -1223,7 +1234,8 @@ async def _run_simulation_inner(
         evaluation_results_rows.append(
             {
                 "name": eval_result["name"],
-                "value": int(eval_result["match"]),
+                "type": eval_result.get("type", "binary"),
+                "value": eval_result["value"],
                 "reasoning": eval_result["reasoning"],
             }
         )
@@ -1468,6 +1480,11 @@ async def _run_single_simulation_inner(
                     "Bot task completed unexpectedly before simulation could connect"
                 )
 
+            # Extract judge config
+            judge_config = config.get("judge", {})
+            sim_judge_model = judge_config.get("model", DEFAULT_SIMULATION_JUDGE_MODEL)
+            sim_stt_judge_model = judge_config.get("stt_model", judge_config.get("model", DEFAULT_STT_JUDGE_MODEL))
+
             sim_task = asyncio.create_task(
                 run_simulation(
                     user_system_prompt,
@@ -1480,6 +1497,8 @@ async def _run_single_simulation_inner(
                     agent_speaks_first=agent_speaks_first,
                     max_turns=max_turns,
                     tools=config.get("tools", []),
+                    judge_model=sim_judge_model,
+                    stt_judge_model=sim_stt_judge_model,
                 )
             )
             simulation_tasks = [bot_task, sim_task]
@@ -1547,11 +1566,10 @@ async def _run_single_simulation_inner(
     if simulation_result:
         sim_metrics_row = {"name": simulation_name}
 
-        # Evaluation criteria metrics
+        # Evaluation criteria metrics (value works for both binary 0/1 and rating score)
         for eval_result in simulation_result.get("evaluation_results", []):
             criterion_name = eval_result["name"]
-            match_value = float(eval_result["match"])
-            sim_metrics_row[criterion_name] = match_value
+            sim_metrics_row[criterion_name] = float(eval_result["value"])
 
         # STT LLM judge score
         stt_judge = simulation_result.get("metrics", {}).get("stt_llm_judge")
@@ -1654,11 +1672,10 @@ async def main():
 
         all_simulation_metrics.append(sim_metrics_row)
 
-        # Evaluation criteria metrics
+        # Evaluation criteria metrics (value works for both binary 0/1 and rating score)
         for eval_result in evaluation_results:
             criterion_name = eval_result["name"]
-            match_value = float(eval_result["match"])
-            metrics_by_criterion[criterion_name].append(match_value)
+            metrics_by_criterion[criterion_name].append(float(eval_result["value"]))
 
         # STT LLM judge score
         if stt_judge and "score" in stt_judge:
@@ -1667,9 +1684,21 @@ async def main():
     # Compute and save aggregated metrics
     metrics_summary = {}
 
+    # Track criterion types (best-effort; default binary)
+    criterion_types = {}
+    for result in results:
+        if isinstance(result, Exception) or result is None:
+            continue
+        _, evaluation_results, _ = result
+        for eval_result in evaluation_results or []:
+            criterion_types.setdefault(
+                eval_result["name"], eval_result.get("type", "binary")
+            )
+
     # Aggregate evaluation criteria metrics
     for criterion_name, values in metrics_by_criterion.items():
         metrics_summary[criterion_name] = {
+            "type": criterion_types.get(criterion_name, "binary"),
             "mean": float(np.mean(values)),
             "std": float(np.std(values)),
             "values": values,

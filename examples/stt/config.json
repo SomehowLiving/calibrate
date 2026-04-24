@@ -1,0 +1,18 @@
+{
+  "judge": {
+    "model": "gpt-4.1-2025-04-14"
+  },
+  "evaluation_criteria": [
+    {
+      "name": "semantic_match",
+      "description": "Check whether the values represented by both strings match semantically. E.g. '1,2,3' matches 'one, two, three'. Ignore formatting differences like extra spaces. If all values match, mark as True."
+    },
+    {
+      "name": "transcription_quality",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Rate overall transcription quality: 1 (unusable), 3 (some errors but gist preserved), 5 (word-perfect)."
+    }
+  ]
+}
