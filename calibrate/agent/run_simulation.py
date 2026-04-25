@@ -1176,15 +1176,20 @@ async def _run_simulation_inner(
         transcript, evaluation_criteria, agent_system_prompt=system_prompt, model=judge_model
     )
 
-    evaluation_results = [
-        {
+    def _build_eval_row(criterion: dict, judge_row: dict) -> dict:
+        row = {
             "name": criterion["name"],
             "type": "rating" if is_rating(criterion) else "binary",
-            "value": criterion_result_value(
-                criterion, llm_judge_result[criterion["name"]]
-            ),
-            "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
+            "value": criterion_result_value(criterion, judge_row),
+            "reasoning": judge_row["reasoning"],
         }
+        if is_rating(criterion):
+            row["scale_min"] = int(criterion["scale_min"])
+            row["scale_max"] = int(criterion["scale_max"])
+        return row
+
+    evaluation_results = [
+        _build_eval_row(criterion, llm_judge_result[criterion["name"]])
         for criterion in evaluation_criteria
     ]
 
@@ -1684,8 +1689,9 @@ async def main():
     # Compute and save aggregated metrics
     metrics_summary = {}
 
-    # Track criterion types (best-effort; default binary)
-    criterion_types = {}
+    # Track criterion types and scale bounds
+    criterion_types: dict = {}
+    criterion_scales: dict = {}
     for result in results:
         if isinstance(result, Exception) or result is None:
             continue
@@ -1694,15 +1700,26 @@ async def main():
             criterion_types.setdefault(
                 eval_result["name"], eval_result.get("type", "binary")
             )
+            if "scale_min" in eval_result and "scale_max" in eval_result:
+                criterion_scales.setdefault(
+                    eval_result["name"],
+                    (
+                        int(eval_result["scale_min"]),
+                        int(eval_result["scale_max"]),
+                    ),
+                )
 
     # Aggregate evaluation criteria metrics
     for criterion_name, values in metrics_by_criterion.items():
-        metrics_summary[criterion_name] = {
+        entry = {
             "type": criterion_types.get(criterion_name, "binary"),
             "mean": float(np.mean(values)),
             "std": float(np.std(values)),
             "values": values,
         }
+        if criterion_name in criterion_scales:
+            entry["scale_min"], entry["scale_max"] = criterion_scales[criterion_name]
+        metrics_summary[criterion_name] = entry
 
     # Aggregate STT LLM judge scores
     if stt_llm_judge_scores:

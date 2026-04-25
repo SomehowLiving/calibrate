@@ -271,5 +271,143 @@ class TestSTTLeaderboardWorkbookRatingTolerant(unittest.TestCase):
             self.assertEqual(len(provider_sheet), 3)
 
 
+# ---------------------------------------------------------------------------
+# Bug 5: simulation metrics.json must persist scale_min/scale_max for rating
+# ---------------------------------------------------------------------------
+
+
+class TestSimulationMetricsPersistScaleBounds(unittest.IsolatedAsyncioTestCase):
+
+    async def test_sdk_simulation_writes_scale_for_rating_criterion(self):
+        """The simulation leaderboard normalizes rating means via
+        (mean - scale_min) / (scale_max - scale_min) * 100. Without the
+        bounds in metrics.json it falls back to 0..1, treating a 1-5 mean
+        of 4.0 as 400% in the overall column. The SDK simulation writer
+        must persist scale_min/scale_max for rating criteria.
+        """
+        from calibrate.llm import simulations
+
+        async def fake_task(
+            semaphore, config, persona_index, user_persona, scenario_index,
+            scenario, output_dir, args, agent=None,
+        ):
+            async with semaphore:
+                eval_results = [
+                    {
+                        "name": "fluency",
+                        "type": "rating",
+                        "value": 4.0,
+                        "reasoning": "good",
+                        "scale_min": 1,
+                        "scale_max": 5,
+                    },
+                ]
+                sim_metrics = {"name": f"sim_{persona_index}_{scenario_index}", "fluency": 4.0}
+                return sim_metrics, eval_results
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch(
+                 "calibrate.llm.run_simulation.run_single_simulation_task",
+                 side_effect=fake_task,
+             ):
+            await simulations.run(
+                system_prompt="...",
+                tools=[],
+                personas=[{"characteristics": "x", "language": "english"}],
+                scenarios=[{"description": "x"}],
+                evaluation_criteria=[{
+                    "name": "fluency",
+                    "type": "rating",
+                    "scale_min": 1,
+                    "scale_max": 5,
+                    "description": "rate fluency",
+                }],
+                output_dir=tmp,
+                model="gpt-4.1",
+                provider="openai",
+            )
+
+            with open(os.path.join(tmp, "metrics.json")) as f:
+                metrics = json.load(f)
+
+        self.assertEqual(metrics["fluency"]["type"], "rating")
+        self.assertEqual(metrics["fluency"]["scale_min"], 1)
+        self.assertEqual(metrics["fluency"]["scale_max"], 5)
+        self.assertAlmostEqual(metrics["fluency"]["mean"], 4.0)
+
+
+class TestSimulationLeaderboardNormalizesWithPersistedBounds(unittest.TestCase):
+    """End-to-end: a metrics.json written by the SDK with scale bounds
+    should produce the right normalized overall in the leaderboard."""
+
+    def test_overall_uses_persisted_bounds(self):
+        import pathlib
+        import pandas as pd
+        from calibrate.llm.simulation_leaderboard import generate_leaderboard
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            (base / "model-a").mkdir()
+            (base / "model-a" / "metrics.json").write_text(json.dumps({
+                "fluency": {
+                    "type": "rating",
+                    "mean": 4.0,
+                    "scale_min": 1,
+                    "scale_max": 5,
+                },
+            }))
+
+            save_dir = base / "leaderboard"
+            generate_leaderboard(str(base), str(save_dir))
+
+            df = pd.read_csv(save_dir / "simulation_leaderboard.csv")
+            row = df[df["model"] == "model-a"].iloc[0]
+            # Rating display column shows raw mean
+            self.assertAlmostEqual(row["fluency"], 4.0)
+            # Overall normalized: (4-1)/(5-1)*100 = 75.0
+            # Without scale bounds the fallback would give 400.
+            self.assertAlmostEqual(row["overall"], 75.0)
+
+
+# ---------------------------------------------------------------------------
+# Bug 6: tests_leaderboard chart should not mislabel rating bars
+# ---------------------------------------------------------------------------
+
+
+class TestTestsLeaderboardChartNormalizesRating(unittest.TestCase):
+
+    def test_chart_renders_with_mixed_binary_and_rating(self):
+        """Mixed configs should produce a chart without crashing and
+        without clipping rating bars to a 0..105 'pass rate' axis."""
+        import pathlib
+        from calibrate.llm.tests_leaderboard import generate_leaderboard
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            (base / "model-a").mkdir()
+            (base / "model-a" / "metrics.json").write_text(json.dumps({
+                "total": 4, "passed": 3,
+                "criteria": {
+                    "accuracy": {
+                        "type": "binary",
+                        "passed": 3, "total": 4, "pass_rate": 75.0,
+                    },
+                    "fluency": {
+                        "type": "rating",
+                        "mean": 4.0,
+                        "min": 3, "max": 5, "count": 4,
+                        "scale_min": 1, "scale_max": 5,
+                    },
+                },
+            }))
+            save_dir = base / "leaderboard"
+            generate_leaderboard(str(base), str(save_dir))
+
+            chart_path = save_dir / "llm_leaderboard.png"
+            self.assertTrue(chart_path.exists())
+            # File should be a non-trivial PNG
+            self.assertGreater(chart_path.stat().st_size, 1000)
+
+
 if __name__ == "__main__":
     unittest.main()

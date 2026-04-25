@@ -73,13 +73,26 @@ def generate_leaderboard(output_dir: str, save_dir: str) -> None:
         }
     )
 
+    # Resolve type + scale per criterion (first model that has it wins)
+    criterion_info: Dict[str, dict] = {}
+    for data in model_data.values():
+        for name, crit in (data.get("criteria") or {}).items():
+            if name not in criterion_info and isinstance(crit, dict):
+                info = {"type": crit.get("type", "binary")}
+                if crit.get("type") == "rating":
+                    info["scale_min"] = crit.get("scale_min")
+                    info["scale_max"] = crit.get("scale_max")
+                criterion_info[name] = info
+
     leaderboard_df = _build_leaderboard(model_data, criterion_names)
     csv_path = save_path / "llm_leaderboard.csv"
     leaderboard_df.to_csv(csv_path, index=False)
     print(f"Saved leaderboard CSV to {csv_path}")
 
     chart_path = save_path / "llm_leaderboard.png"
-    _create_comparison_chart(leaderboard_df, criterion_names, chart_path)
+    _create_comparison_chart(
+        leaderboard_df, criterion_names, criterion_info, chart_path
+    )
 
 
 def _read_metrics(metrics_path: Path) -> Optional[dict]:
@@ -145,13 +158,16 @@ def _build_leaderboard(
 def _create_comparison_chart(
     df: pd.DataFrame,
     criterion_names: List[str],
+    criterion_info: Dict[str, dict],
     chart_path: Path,
 ) -> None:
-    """Render comparison chart.
+    """Render the grouped bar chart.
 
-    - If criterion columns exist, draw a grouped bar chart: x-axis = metric
-      (pass_rate + each criterion), series = model.
-    - Otherwise, fall back to a simple pass_rate bar chart.
+    Rating columns are normalized to 0-100 for the chart only (the CSV
+    keeps the raw mean) so binary % and rating means appear on the same
+    y-axis without misleading scale or clipping. The label and title
+    reflect that the values shown are normalized scores. The accompanying
+    label column suffix ``(rating N-M)`` makes the original scale visible.
     """
     if plt is None:
         raise ImportError(
@@ -162,22 +178,49 @@ def _create_comparison_chart(
         print("Leaderboard dataframe is empty, skipping chart creation.")
         return
 
-    # Pick columns to plot
     metric_columns = ["pass_rate"] + [c for c in criterion_names if c in df.columns]
 
     if len(metric_columns) == 1:
-        # No per-criterion data — simple single-bar chart
         _simple_pass_rate_chart(df, chart_path)
         return
 
-    plot_df = df.set_index("model")[metric_columns].T
+    # Build a chart-only copy of the DataFrame: rating columns scaled to %.
+    # Also rename rating columns to expose their raw scale on the x-axis.
+    chart_df = df.set_index("model")[metric_columns].copy()
+    has_rating = False
+    rename_map: Dict[str, str] = {}
+    for name in criterion_names:
+        if name not in chart_df.columns:
+            continue
+        info = criterion_info.get(name) or {}
+        if info.get("type") == "rating":
+            has_rating = True
+            scale_min = info.get("scale_min")
+            scale_max = info.get("scale_max")
+            if (
+                scale_min is not None
+                and scale_max is not None
+                and scale_max > scale_min
+            ):
+                rng = float(scale_max) - float(scale_min)
+                chart_df[name] = (
+                    (chart_df[name].astype(float) - float(scale_min)) / rng * 100
+                )
+                rename_map[name] = f"{name} (rating {scale_min}-{scale_max})"
+
+    chart_df = chart_df.rename(index=rename_map)
+    plot_df = chart_df.T
 
     fig, ax = plt.subplots(figsize=(max(8, len(metric_columns) * 1.5), 5))
     plot_df.plot(kind="bar", ax=ax)
-    ax.set_ylabel("Pass Rate (%)")
+    if has_rating:
+        ax.set_ylabel("Score (%) — rating criteria normalized to scale")
+        ax.set_title("LLM Test Score by Metric (normalized)")
+    else:
+        ax.set_ylabel("Pass Rate (%)")
+        ax.set_title("LLM Test Pass Rate by Metric")
     ax.set_xlabel("Metric")
     ax.set_ylim(0, 105)
-    ax.set_title("LLM Test Pass Rate by Metric")
     ax.legend(title="Model", loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=2)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     plt.xticks(rotation=45, ha="right")

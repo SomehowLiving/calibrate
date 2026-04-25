@@ -48,6 +48,25 @@ from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 from calibrate.llm.metrics import evaluate_simuation, DEFAULT_SIMULATION_JUDGE_MODEL
 from calibrate.judges import criterion_result_value, is_rating
+
+
+def _build_evaluation_result(criterion: dict, judge_row: dict) -> dict:
+    """Build a per-row evaluation result, carrying rating scale bounds when relevant.
+
+    The scale bounds propagate through to ``metrics.json`` so the simulation
+    leaderboard can normalize rating means correctly when computing the
+    ``overall`` column.
+    """
+    result = {
+        "name": criterion["name"],
+        "type": "rating" if is_rating(criterion) else "binary",
+        "value": criterion_result_value(criterion, judge_row),
+        "reasoning": judge_row["reasoning"],
+    }
+    if is_rating(criterion):
+        result["scale_min"] = int(criterion["scale_min"])
+        result["scale_max"] = int(criterion["scale_max"])
+    return result
 import pandas as pd
 import numpy as np
 
@@ -504,14 +523,7 @@ async def run_simulation(
     )
 
     evaluation_results = [
-        {
-            "name": criterion["name"],
-            "type": "rating" if is_rating(criterion) else "binary",
-            "value": criterion_result_value(
-                criterion, llm_judge_result[criterion["name"]]
-            ),
-            "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
-        }
+        _build_evaluation_result(criterion, llm_judge_result[criterion["name"]])
         for criterion in evaluation_criteria
     ]
 
@@ -653,14 +665,7 @@ async def run_simulation_with_agent(
     llm_judge_result = await evaluate_simuation(transcript, evaluation_criteria, model=judge_model)
 
     evaluation_results = [
-        {
-            "name": criterion["name"],
-            "type": "rating" if is_rating(criterion) else "binary",
-            "value": criterion_result_value(
-                criterion, llm_judge_result[criterion["name"]]
-            ),
-            "reasoning": llm_judge_result[criterion["name"]]["reasoning"],
-        }
+        _build_evaluation_result(criterion, llm_judge_result[criterion["name"]])
         for criterion in evaluation_criteria
     ]
 
@@ -922,8 +927,9 @@ async def main():
         for metric_dict in evaluation_results:
             metrics[metric_dict["name"]].append(float(metric_dict["value"]))
 
-    # Track criterion types per metric name (defaults to binary if not marked)
-    criterion_types = {}
+    # Track criterion types and scale bounds per metric name
+    criterion_types: dict = {}
+    criterion_scales: dict = {}
     for result in results:
         if isinstance(result, Exception):
             continue
@@ -932,16 +938,24 @@ async def main():
             criterion_types.setdefault(
                 metric_dict["name"], metric_dict.get("type", "binary")
             )
+            if "scale_min" in metric_dict and "scale_max" in metric_dict:
+                criterion_scales.setdefault(
+                    metric_dict["name"],
+                    (int(metric_dict["scale_min"]), int(metric_dict["scale_max"])),
+                )
 
     metrics_summary = {}
 
     for metric_name, metric_values in metrics.items():
-        metrics_summary[metric_name] = {
+        entry = {
             "type": criterion_types.get(metric_name, "binary"),
             "mean": np.mean(metric_values),
             "std": np.std(metric_values),
             "values": metric_values,
         }
+        if metric_name in criterion_scales:
+            entry["scale_min"], entry["scale_max"] = criterion_scales[metric_name]
+        metrics_summary[metric_name] = entry
 
     df = pd.DataFrame(all_simulation_metrics)
     df.to_csv(join(output_dir, "results.csv"), index=False)

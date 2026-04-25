@@ -567,6 +567,7 @@ class _Simulations:
         # Collect metrics
         metrics_by_criterion = defaultdict(list)
         criterion_types: dict = {}  # name -> "binary" | "rating"
+        criterion_scales: dict = {}  # name -> (scale_min, scale_max) for ratings
         all_simulation_metrics = []
 
         for result in results:
@@ -585,16 +586,29 @@ class _Simulations:
                     criterion_types.setdefault(
                         eval_result["name"], eval_result.get("type", "binary")
                     )
+                    if "scale_min" in eval_result and "scale_max" in eval_result:
+                        criterion_scales.setdefault(
+                            eval_result["name"],
+                            (
+                                int(eval_result["scale_min"]),
+                                int(eval_result["scale_max"]),
+                            ),
+                        )
 
         # Compute summary
         metrics_summary = {}
         for criterion_name, values in metrics_by_criterion.items():
-            metrics_summary[criterion_name] = {
+            entry = {
                 "type": criterion_types.get(criterion_name, "binary"),
                 "mean": float(np.mean(values)),
                 "std": float(np.std(values)),
                 "values": values,
             }
+            if criterion_name in criterion_scales:
+                entry["scale_min"], entry["scale_max"] = criterion_scales[
+                    criterion_name
+                ]
+            metrics_summary[criterion_name] = entry
 
         # Save results
         if all_simulation_metrics:
