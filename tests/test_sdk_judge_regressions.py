@@ -409,5 +409,39 @@ class TestTestsLeaderboardChartNormalizesRating(unittest.TestCase):
             self.assertGreater(chart_path.stat().st_size, 1000)
 
 
+# ---------------------------------------------------------------------------
+# Bug 7: simulation_leaderboard chart should not mislabel rating bars
+# ---------------------------------------------------------------------------
+
+
+class TestSimulationLeaderboardChartNormalizesRating(unittest.TestCase):
+
+    def test_chart_renders_with_mixed_binary_and_rating(self):
+        """Rating means on a 1-5 scale shouldn't be plotted on a 0-105
+        Score % axis — bars would look artificially tiny or get clipped."""
+        import pathlib
+        from calibrate.llm.simulation_leaderboard import generate_leaderboard
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            (base / "model-a").mkdir()
+            (base / "model-a" / "metrics.json").write_text(json.dumps({
+                "tool_usage": {"type": "binary", "mean": 0.8},
+                "fluency": {
+                    "type": "rating",
+                    "mean": 4.0,
+                    "scale_min": 1,
+                    "scale_max": 5,
+                },
+            }))
+
+            save_dir = base / "leaderboard"
+            generate_leaderboard(str(base), str(save_dir))
+
+            chart_path = save_dir / "simulation_leaderboard.png"
+            self.assertTrue(chart_path.exists())
+            self.assertGreater(chart_path.stat().st_size, 1000)
+
+
 if __name__ == "__main__":
     unittest.main()
