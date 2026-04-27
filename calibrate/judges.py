@@ -67,7 +67,7 @@ DEFAULT_TEXT_JUDGE_MODEL = "openai/gpt-5.4-mini"
 # Simulation uses a stronger model by default for grading multi-turn conversations
 DEFAULT_SIMULATION_JUDGE_MODEL = "openai/gpt-5.4-mini"
 # OpenRouter's audio-capable OpenAI model. Override per-evaluator when needed.
-DEFAULT_AUDIO_JUDGE_MODEL = "google/gemini-2.5-flash"
+DEFAULT_AUDIO_JUDGE_MODEL = "openai/gpt-audio"
 
 
 # ── Evaluator type tags ─────────────────────────────────────────────────────
