@@ -322,7 +322,7 @@ export function SimulationsApp({ onBack }: { onBack?: () => void }) {
     };
 
     if (simType === "text") {
-      // Always need OPENAI_API_KEY for LLM judge/evaluation
+      // Always need OPENAI_API_KEY for evaluators
       addIfMissing("OPENAI_API_KEY");
       // Need OPENROUTER_API_KEY if using OpenRouter
       if (provider === "openrouter" && !isAgentConnection) {
@@ -914,7 +914,7 @@ export function SimulationsApp({ onBack }: { onBack?: () => void }) {
           {header}
           <Text dimColor>
             Path to a JSON config file containing system prompt, tools,
-            personas, scenarios, and evaluation criteria.
+            personas, scenarios, and evaluators.
           </Text>
           {initError ? (
             <Box marginTop={1}>

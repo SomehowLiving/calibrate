@@ -31,6 +31,7 @@ from calibrate.stt.eval import (
     STT_LANGUAGES,
 )
 from calibrate.stt.leaderboard import generate_leaderboard
+from calibrate.utils import StreamTee
 
 
 # Maximum number of providers to run in parallel
@@ -72,8 +73,7 @@ async def run(
     ignore_retry: bool = False,
     overwrite: bool = False,
     max_parallel: int = MAX_PARALLEL_PROVIDERS,
-    judge_model: str = None,
-    judge_criteria: list[dict] = None,
+    judge_evaluators: list[dict] = None,
 ) -> dict:
     """
     Run STT evaluation for one or more providers and generate a leaderboard.
@@ -91,8 +91,9 @@ async def run(
         ignore_retry: Skip retry if not all audios are processed
         overwrite: Overwrite existing results instead of resuming from checkpoint (default: False)
         max_parallel: Maximum number of providers to run in parallel (default: 2)
-        judge_model: Optional model override for LLM judge
-        judge_criteria: Optional list of evaluation criteria dicts for multi-criteria judging
+        judge_evaluators: Optional list of evaluator dicts (each with ``name``,
+            ``system_prompt``, ``judge_model``, ``type``, ...). When omitted
+            the implicit default STT evaluator runs.
 
     Returns:
         dict: Results summary with status and output paths
@@ -123,8 +124,7 @@ async def run(
                 debug_count=debug_count,
                 ignore_retry=ignore_retry,
                 overwrite=overwrite,
-                judge_model=judge_model,
-                judge_criteria=judge_criteria,
+                judge_evaluators=judge_evaluators,
             )
             return (provider, result)
 
@@ -208,7 +208,7 @@ async def main():
     parser.add_argument(
         "--ignore_retry",
         action="store_true",
-        help="Ignore retrying if all the audios are not processed and move on to LLM judge",
+        help="Ignore retrying if all the audios are not processed and move on to evaluators",
     )
     parser.add_argument(
         "--overwrite",
@@ -226,7 +226,7 @@ async def main():
         "--config",
         type=str,
         default=None,
-        help="Path to optional JSON config file with judge settings (model, prompt)",
+        help="Path to optional JSON config file with an `evaluators` list",
     )
 
     args = parser.parse_args()
@@ -246,66 +246,91 @@ async def main():
         print(f"\033[31mInput validation error: {error_msg}\033[0m")
         sys.exit(1)
 
-    if not exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    # ``exist_ok=True`` makes this safe when several ``calibrate stt``
+    # subprocesses race to create the output dir on first use; the previous
+    # ``if not exists: makedirs(...)`` pattern was non-atomic and the loser
+    # raised ``FileExistsError``.
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    print("\n\033[91mSTT Benchmark\033[0m\n")
-    print(f"Provider(s): {', '.join(providers)}")
-    print(f"Language: {args.language}")
-    print(f"Input: {args.input_dir}")
-    print(f"Output: {args.output_dir}")
-    print("")
+    # Mirror everything written to stdout/stderr into a single output-dir-level
+    # `logs` file so the full terminal session (header, per-provider output,
+    # tqdm progress, leaderboard prints, summary) is captured in one place.
+    log_path = join(args.output_dir, "logs")
+    if exists(log_path):
+        os.remove(log_path)
+    log_file = open(log_path, "w")
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = StreamTee(original_stdout, log_file)
+    sys.stderr = StreamTee(original_stderr, log_file)
 
-    # Run benchmark
-    # Load judge config from optional config file
-    judge_model = None
-    judge_criteria = None
-    if args.config:
-        import json as _json
-        with open(args.config) as _f:
-            _cfg = _json.load(_f)
-        judge_model = _cfg.get("judge", {}).get("model")
-        judge_criteria = _cfg.get("evaluation_criteria")
+    try:
+        print("\n\033[91mSTT Benchmark\033[0m\n")
+        print(f"Provider(s): {', '.join(providers)}")
+        print(f"Language: {args.language}")
+        print(f"Input: {args.input_dir}")
+        print(f"Output: {args.output_dir}")
+        print("")
 
-    result = await run(
-        providers=providers,
-        language=args.language,
-        input_dir=args.input_dir,
-        input_file_name=args.input_file_name,
-        output_dir=args.output_dir,
-        debug=args.debug,
-        debug_count=args.debug_count,
-        ignore_retry=args.ignore_retry,
-        overwrite=args.overwrite,
-        judge_model=judge_model,
-        judge_criteria=judge_criteria,
-    )
+        # Run benchmark
+        # Load evaluators from optional config file
+        judge_evaluators = None
+        if args.config:
+            import json as _json
 
-    # Print summary
-    print(f"\n\033[92m{'='*60}\033[0m")
-    print(f"\033[92mSummary\033[0m")
-    print(f"\033[92m{'='*60}\033[0m\n")
+            with open(args.config) as _f:
+                _cfg = _json.load(_f)
+            judge_evaluators = _cfg.get("evaluators")
 
-    has_errors = False
-    provider_results = result.get("providers", {})
-    for provider in providers:
-        prov_result = provider_results.get(provider, {})
-        if isinstance(prov_result, str) and prov_result.startswith("error"):
-            print(f"  {provider}: \033[31m{prov_result}\033[0m")
-        elif prov_result.get("status") == "error":
-            print(f"  {provider}: \033[31mError - {prov_result.get('error')}\033[0m")
-            has_errors = True
-        else:
-            metrics = prov_result.get("metrics", {})
-            wer = metrics.get("wer", 0)
-            judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
-            judge_str = ", ".join(f"{k}={v:.4f}" for k, v in judge_scores.items())
-            print(f"  {provider}: WER={wer:.4f}, {judge_str}")
+        result = await run(
+            providers=providers,
+            language=args.language,
+            input_dir=args.input_dir,
+            input_file_name=args.input_file_name,
+            output_dir=args.output_dir,
+            debug=args.debug,
+            debug_count=args.debug_count,
+            ignore_retry=args.ignore_retry,
+            overwrite=args.overwrite,
+            judge_evaluators=judge_evaluators,
+        )
 
-    if has_errors:
-        sys.exit(1)
+        # Print summary
+        print(f"\n\033[92m{'='*60}\033[0m")
+        print(f"\033[92mSummary\033[0m")
+        print(f"\033[92m{'='*60}\033[0m\n")
 
-    print(f"\n\033[92mLeaderboard saved to: {result.get('leaderboard_dir')}\033[0m")
+        has_errors = False
+        provider_results = result.get("providers", {})
+        for provider in providers:
+            prov_result = provider_results.get(provider, {})
+            if isinstance(prov_result, str) and prov_result.startswith("error"):
+                print(f"  {provider}: \033[31m{prov_result}\033[0m")
+            elif prov_result.get("status") == "error":
+                print(
+                    f"  {provider}: \033[31mError - {prov_result.get('error')}\033[0m"
+                )
+                has_errors = True
+            else:
+                metrics = prov_result.get("metrics", {})
+                wer = metrics.get("wer", 0)
+                judge_scores = {
+                    k: v for k, v in metrics.items() if k.endswith("_score")
+                }
+                judge_str = ", ".join(
+                    f"{k}={v:.4f}" for k, v in judge_scores.items()
+                )
+                print(f"  {provider}: WER={wer:.4f}, {judge_str}")
+
+        if has_errors:
+            sys.exit(1)
+
+        print(
+            f"\n\033[92mLeaderboard saved to: {result.get('leaderboard_dir')}\033[0m"
+        )
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 
 if __name__ == "__main__":

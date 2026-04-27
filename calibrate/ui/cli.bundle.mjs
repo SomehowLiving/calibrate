@@ -47202,6 +47202,56 @@ var OPENROUTER_MODEL_EXAMPLES = [
 
 // source/llm-app.tsx
 var import_jsx_runtime2 = __toESM(require_jsx_runtime(), 1);
+function parseEvaluatorsFromMetrics(metricsJsonPath) {
+  try {
+    if (!fs4.existsSync(metricsJsonPath)) return void 0;
+    const mj = JSON.parse(fs4.readFileSync(metricsJsonPath, "utf-8"));
+    const evaluators = {};
+    const crit = mj?.criteria;
+    if (crit && typeof crit === "object") {
+      for (const [name, agg] of Object.entries(
+        crit
+      )) {
+        if (agg?.["type"] === "binary") {
+          const rate = typeof agg["pass_rate"] === "number" ? agg["pass_rate"] : 0;
+          evaluators[name] = {
+            type: "binary",
+            display: `${rate.toFixed(1)}%`,
+            sortValue: rate
+          };
+        } else if (agg?.["type"] === "rating") {
+          const mean = typeof agg["mean"] === "number" ? agg["mean"] : 0;
+          const hi = agg["scale_max"] ?? 5;
+          evaluators[name] = {
+            type: "rating",
+            display: `${mean.toFixed(2)}/${hi}`,
+            sortValue: mean
+          };
+        }
+      }
+    }
+    const tools = mj?.tool_calls;
+    if (tools && typeof tools === "object") {
+      for (const [name, agg] of Object.entries(
+        tools
+      )) {
+        const rate = typeof agg?.["pass_rate"] === "number" ? agg["pass_rate"] : 0;
+        evaluators[`tool:${name}`] = {
+          type: "binary",
+          display: `${rate.toFixed(1)}%`,
+          sortValue: rate
+        };
+      }
+    }
+    return Object.keys(evaluators).length > 0 ? evaluators : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function formatEvaluatorSummary(evaluators) {
+  if (!evaluators || Object.keys(evaluators).length === 0) return "Done";
+  return Object.entries(evaluators).map(([name, ev]) => `${name}: ${ev.display}`).join(" \xB7 ");
+}
 function LlmTestsApp({ onBack }) {
   const { exit } = use_app_default();
   const [step, setStep] = (0, import_react23.useState)("init");
@@ -47394,6 +47444,11 @@ function LlmTestsApp({ onBack }) {
     setPhase("eval");
     setRunningCount(0);
     setNextModelIdx(0);
+    try {
+      const sharedLog = path3.join(config.outputDir, "logs");
+      if (fs4.existsSync(sharedLog)) fs4.unlinkSync(sharedLog);
+    } catch {
+    }
   }, [step]);
   const startModel = (model) => {
     if (!config.calibrate) return;
@@ -47405,6 +47460,7 @@ function LlmTestsApp({ onBack }) {
     }
     Object.assign(env3, config.envVars);
     env3.PYTHONUNBUFFERED = "1";
+    env3.CALIBRATE_LLM_LOG_APPEND = "1";
     const cmdArgs = config.agentUrl ? [
       ...bin.args,
       "llm",
@@ -47468,6 +47524,12 @@ function LlmTestsApp({ onBack }) {
             ).length;
             const total = results.length;
             metricsData = { passed, failed: total - passed, total };
+          }
+          const evaluators = parseEvaluatorsFromMetrics(
+            path3.join(getResultsDir(model), "metrics.json")
+          );
+          if (evaluators) {
+            metricsData = { ...metricsData ?? {}, evaluators };
           }
         } catch {
         }
@@ -47572,51 +47634,32 @@ function LlmTestsApp({ onBack }) {
     const results = [];
     const metricKeys = config.agentUrl ? config.agentBenchmark ? config.agentModels : ["agent"] : config.models;
     for (const model of metricKeys) {
+      const resultsPath = path3.join(getResultsDir(model), "results.json");
+      if (!fs4.existsSync(resultsPath)) continue;
+      const evaluators = parseEvaluatorsFromMetrics(
+        path3.join(getResultsDir(model), "metrics.json")
+      );
+      let total;
+      let passed;
       try {
-        const resultsPath = path3.join(getResultsDir(model), "results.json");
-        if (fs4.existsSync(resultsPath)) {
+        const metricsPath = path3.join(getResultsDir(model), "metrics.json");
+        if (fs4.existsSync(metricsPath)) {
+          const mj = JSON.parse(fs4.readFileSync(metricsPath, "utf-8"));
+          if (typeof mj?.total === "number") total = mj.total;
+          if (typeof mj?.passed === "number") passed = mj.passed;
+        }
+        if (total === void 0 || passed === void 0) {
           const data = JSON.parse(fs4.readFileSync(resultsPath, "utf-8"));
-          const passed = data.filter(
-            (r) => r.metrics?.passed
-          ).length;
-          const total = data.length;
-          const failed = total - passed;
-          const pass_rate = total > 0 ? passed / total * 100 : 0;
-          results.push({ model, passed, failed, total, pass_rate });
+          if (Array.isArray(data)) {
+            total = total ?? data.length;
+            passed = passed ?? data.filter(
+              (r) => r.metrics?.passed
+            ).length;
+          }
         }
       } catch {
       }
-    }
-    try {
-      const lbCsvPath = path3.join(
-        config.outputDir,
-        "leaderboard",
-        "llm_leaderboard.csv"
-      );
-      if (fs4.existsSync(lbCsvPath)) {
-        const lines = fs4.readFileSync(lbCsvPath, "utf-8").trim().split("\n");
-        if (lines.length > 1) {
-          const headers = lines[0].split(",").map((h) => h.trim());
-          const overallIdx = headers.findIndex(
-            (h) => h.toLowerCase() === "overall"
-          );
-          const modelIdx = headers.findIndex(
-            (h) => h.toLowerCase() === "model" || h.toLowerCase() === "provider"
-          );
-          if (overallIdx >= 0 && modelIdx >= 0) {
-            for (let i = 1; i < lines.length; i++) {
-              const vals = lines[i].split(",");
-              const modelName = vals[modelIdx]?.trim() || "";
-              const overall = parseFloat(vals[overallIdx] || "0") || 0;
-              const result = results.find((r) => r.model === modelName);
-              if (result) {
-                result.overall = overall;
-              }
-            }
-          }
-        }
-      }
-    } catch {
+      results.push({ model, total, passed, evaluators });
     }
     setMetrics(results);
   };
@@ -47625,6 +47668,8 @@ function LlmTestsApp({ onBack }) {
     return toolCalls.map((tc) => `${tc.tool}(${JSON.stringify(tc.arguments)})`).join(", ");
   };
   (0, import_react23.useEffect)(() => {
+    setModelResults([]);
+    setScrollOffset(0);
     if (!selectedModel) return;
     try {
       const resultsPath = path3.join(getResultsDir(selectedModel), "results.json");
@@ -47641,7 +47686,18 @@ function LlmTestsApp({ onBack }) {
             let evaluationCriteria = "";
             const evalType = r.test_case?.evaluation?.type || "";
             if (evalType === "response") {
-              evaluationCriteria = r.test_case?.evaluation?.criteria || "";
+              const raw = r.test_case?.evaluation?.criteria;
+              if (Array.isArray(raw)) {
+                evaluationCriteria = raw.map((c) => {
+                  if (typeof c === "string") return c;
+                  if (c && typeof c === "object" && "name" in c) {
+                    return String(c.name);
+                  }
+                  return "";
+                }).filter(Boolean).join(", ");
+              } else if (typeof raw === "string") {
+                evaluationCriteria = raw;
+              }
             } else if (evalType === "tool_call" && r.test_case?.evaluation?.tool_calls) {
               evaluationCriteria = formatToolCalls(
                 r.test_case.evaluation.tool_calls
@@ -47654,17 +47710,14 @@ function LlmTestsApp({ onBack }) {
               evaluationCriteria,
               actualOutput,
               passed: r.metrics?.passed || false,
-              reasoning: r.metrics?.reasoning || ""
+              reasoning: r.metrics?.reasoning || "",
+              judgeResults: r.metrics?.judge_results
             };
           }
         );
         setModelResults(results);
-        setScrollOffset(0);
-      } else {
-        setModelResults([]);
       }
     } catch {
-      setModelResults([]);
     }
   }, [selectedModel, config.outputDir]);
   (0, import_react23.useEffect)(() => {
@@ -48109,12 +48162,7 @@ function LlmTestsApp({ onBack }) {
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Spinner, {}),
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { children: " " })
           ] }) }),
-          singleState.status === "done" && singleState.metrics ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { dimColor: true, children: [
-            singleState.metrics.passed,
-            "/",
-            singleState.metrics.total,
-            " passed"
-          ] }) : singleState.status === "running" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "cyan", children: "Running tests..." }) : singleState.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "red", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Waiting" })
+          singleState.status === "done" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: formatEvaluatorSummary(singleState.metrics?.evaluators) }) : singleState.status === "running" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "cyan", children: "Running tests..." }) : singleState.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "red", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Waiting" })
         ] }),
         !isSingleAgentRun && runKeys.map((model) => {
           const state = modelStates[model];
@@ -48126,12 +48174,7 @@ function LlmTestsApp({ onBack }) {
               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { children: " " })
             ] }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: " - " }) }),
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { width: 30, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: state.status === "running", children: model }) }),
-            state.status === "done" && state.metrics ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { dimColor: true, children: [
-              state.metrics.passed,
-              "/",
-              state.metrics.total,
-              " passed"
-            ] }) : state.status === "running" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "cyan", children: "Running..." }) : state.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "red", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Waiting" })
+            state.status === "done" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: formatEvaluatorSummary(state.metrics?.evaluators) }) : state.status === "running" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "cyan", children: "Running..." }) : state.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "red", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Waiting" })
           ] }, model);
         }),
         phase === "eval" && runningModels.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { flexDirection: "row", marginTop: 1, children: runningModels.map((model, idx) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
@@ -48181,7 +48224,47 @@ function LlmTestsApp({ onBack }) {
       const leaderboardDir = path3.join(config.outputDir, "leaderboard");
       const resolvedOutputDir = path3.resolve(config.outputDir);
       const leaderboardKeys = config.agentUrl ? config.agentBenchmark ? config.agentModels : ["agent"] : config.models;
+      const isModelFailed = (m) => {
+        const resultsPath = path3.join(getResultsDir(m), "results.json");
+        if (fs4.existsSync(resultsPath)) return false;
+        return modelStates[m]?.status !== "running";
+      };
       if (view === "model-detail" && selectedModel) {
+        const failed = isModelFailed(selectedModel);
+        if (failed) {
+          const errorLogs = (modelStates[selectedModel]?.logs ?? []).map(
+            (l) => stripAnsi2(l)
+          );
+          return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginBottom: 1, children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, color: "cyan", children: selectedModel }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: " \u2014 " }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, color: "red", children: "Run Failed" })
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginBottom: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { children: [
+              "No results were produced for this model. The",
+              " ",
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "cyan", children: "calibrate llm" }),
+              " ",
+              "subprocess exited with an error."
+            ] }) }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", marginBottom: 1, children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "Last subprocess output:" }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                Box_default,
+                {
+                  flexDirection: "column",
+                  marginTop: 1,
+                  borderStyle: "single",
+                  borderColor: "red",
+                  paddingX: 1,
+                  children: errorLogs.length > 0 ? errorLogs.map((line, i) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { wrap: "wrap", children: line }, i)) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "(no output captured \u2014 try re-running this model)" })
+                }
+              )
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Press q or Esc to go back to leaderboard" }) })
+          ] });
+        }
         const visibleRows = modelResults.slice(
           scrollOffset,
           scrollOffset + MAX_VISIBLE_ROWS
@@ -48212,10 +48295,10 @@ function LlmTestsApp({ onBack }) {
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginBottom: 1, children: [
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { bold: true, children: [
                       "Test ",
-                      r.id
+                      r.id,
+                      " "
                     ] }),
-                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { children: " " }),
-                    r.passed ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "green", bold: true, children: "\u2713 Pass" }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color: "red", bold: true, children: "\u2717 Fail" })
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, color: r.passed ? "green" : "red", children: r.passed ? "\u2713 Pass" : "\u2717 Fail" })
                   ] }),
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", marginBottom: 1, children: [
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "History:" }),
@@ -48229,7 +48312,7 @@ function LlmTestsApp({ onBack }) {
                   ] }),
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", marginBottom: 1, children: [
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { bold: true, dimColor: true, children: [
-                      "Criteria (",
+                      "Evaluators (",
                       r.evaluationType || "unknown",
                       "):"
                     ] }),
@@ -48239,9 +48322,37 @@ function LlmTestsApp({ onBack }) {
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "Actual Output:" }),
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginLeft: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { wrap: "wrap", children: truncate(r.actualOutput || "-", 80) }) })
                   ] }),
+                  r.judgeResults && Object.keys(r.judgeResults).length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", marginBottom: 1, children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "Evaluator Results:" }),
+                    Object.entries(r.judgeResults).map(([name, ev]) => {
+                      const isBinary = typeof ev?.match === "boolean";
+                      const isRating = typeof ev?.score === "number";
+                      const color = isBinary ? ev?.match ? "green" : "red" : void 0;
+                      const label = isBinary ? ev?.match ? "Pass" : "Fail" : isRating ? String(ev?.score) : "-";
+                      return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                        Box_default,
+                        {
+                          flexDirection: "column",
+                          marginLeft: 1,
+                          marginTop: 1,
+                          children: [
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { children: [
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { bold: true, children: [
+                                name,
+                                ": "
+                              ] }),
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { color, children: label })
+                            ] }),
+                            ev?.reasoning ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginLeft: 2, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { wrap: "wrap", children: ev.reasoning }) }) : null
+                          ]
+                        },
+                        name
+                      );
+                    })
+                  ] }),
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "Reasoning:" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginLeft: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { wrap: "wrap", color: r.passed ? "green" : "red", children: r.reasoning || "-" }) })
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, dimColor: true, children: "Summary:" }),
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginLeft: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { wrap: "wrap", children: r.reasoning || "-" }) })
                   ] })
                 ]
               },
@@ -48270,63 +48381,76 @@ function LlmTestsApp({ onBack }) {
           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "Press q to exit" }) })
         ] });
       }
-      const sortedMetrics = [...metrics].sort(
-        (a, b) => b.pass_rate - a.pass_rate
-      );
+      const seenEval = /* @__PURE__ */ new Set();
+      const evaluatorNames = [];
+      for (const m of metrics) {
+        for (const name of Object.keys(m.evaluators ?? {})) {
+          if (!seenEval.has(name)) {
+            seenEval.add(name);
+            evaluatorNames.push(name);
+          }
+        }
+      }
+      const evaluatorMeta = {};
+      for (const name of evaluatorNames) {
+        const found = metrics.find((m) => m.evaluators?.[name])?.evaluators?.[name];
+        if (found) evaluatorMeta[name] = { type: found.type };
+      }
       return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginBottom: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, color: "cyan", children: "LLM Tests Leaderboard" }) }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-          Table,
-          {
-            columns: [
-              { key: "model", label: "Model", width: 28 },
-              { key: "passed", label: "Passed", width: 8, align: "right" },
-              { key: "failed", label: "Failed", width: 8, align: "right" },
-              { key: "total", label: "Total", width: 8, align: "right" },
-              {
-                key: "pass_rate",
-                label: "Pass Rate",
-                width: 10,
-                align: "right"
-              }
-            ],
-            data: metrics.map((m) => ({
-              model: m.model,
-              passed: String(m.passed),
-              failed: String(m.failed),
-              total: String(m.total),
-              pass_rate: m.pass_rate.toFixed(1) + "%"
-            }))
-          }
-        ),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, children: "Pass Rate" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-            BarChart,
+        (() => {
+          const labelCap = 18;
+          const evaluatorColumns = evaluatorNames.map((name) => ({
+            key: name,
+            label: name.length > labelCap ? name.slice(0, labelCap) : name,
+            width: Math.max(10, Math.min(name.length, labelCap)),
+            align: "right"
+          }));
+          return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            Table,
             {
-              data: sortedMetrics.map((m) => ({
-                label: m.model.length > 25 ? m.model.slice(-25) : m.model,
-                value: m.pass_rate,
-                color: "green"
-              })),
-              maxWidth: 40
+              columns: [
+                { key: "model", label: "Model", width: 28 },
+                { key: "total", label: "Total", width: 7, align: "right" },
+                { key: "passed", label: "Passed", width: 8, align: "right" },
+                { key: "pass_rate", label: "Pass %", width: 9, align: "right" },
+                ...evaluatorColumns
+              ],
+              data: metrics.map((m) => {
+                const row = { model: m.model };
+                row.total = m.total != null ? String(m.total) : "-";
+                row.passed = m.passed != null ? String(m.passed) : "-";
+                row.pass_rate = m.total != null && m.passed != null && m.total > 0 ? `${(m.passed / m.total * 100).toFixed(1)}%` : "-";
+                for (const name of evaluatorNames) {
+                  row[name] = m.evaluators?.[name]?.display ?? "-";
+                }
+                return row;
+              })
             }
-          )
-        ] }),
-        metrics.some((m) => m.overall !== void 0) && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, children: "Overall Score" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-            BarChart,
-            {
-              data: [...metrics].filter((m) => m.overall !== void 0).sort((a, b) => (b.overall || 0) - (a.overall || 0)).map((m) => ({
-                label: m.model.length > 25 ? m.model.slice(-25) : m.model,
-                value: m.overall || 0,
-                color: "cyan"
-              })),
-              maxWidth: 40
-            }
-          )
-        ] }),
+          );
+        })(),
+        evaluatorNames.map((name) => {
+          const meta = evaluatorMeta[name];
+          const data = [...metrics].filter((m) => m.evaluators?.[name]).sort(
+            (a, b) => b.evaluators[name].sortValue - a.evaluators[name].sortValue
+          ).map((m) => ({
+            label: m.model.length > 25 ? m.model.slice(-25) : m.model,
+            value: m.evaluators[name].sortValue,
+            color: meta?.type === "rating" ? "cyan" : "green"
+          }));
+          if (data.length === 0) return null;
+          const subtitle = meta?.type === "rating" ? "(mean rating)" : "(% passed)";
+          return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Text, { bold: true, children: [
+                name,
+                " "
+              ] }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: subtitle })
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(BarChart, { data, maxWidth: 40 })
+          ] }, name);
+        }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { dimColor: true, children: "\u2500".repeat(50) }),
           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Text, { bold: true, children: "View Model Details" }) }),
@@ -48334,10 +48458,20 @@ function LlmTestsApp({ onBack }) {
             SelectInput,
             {
               items: [
-                ...leaderboardKeys.map((m) => ({
-                  label: config.agentUrl && !config.agentBenchmark ? "View test-by-test results" : `${m} \u2014 View test-by-test results`,
-                  value: m
-                })),
+                ...leaderboardKeys.map((m) => {
+                  const isAgent = config.agentUrl && !config.agentBenchmark;
+                  const failed = isModelFailed(m);
+                  if (failed) {
+                    return {
+                      label: isAgent ? "Failed (view error)" : `${m} \u2014 Failed (view error)`,
+                      value: m
+                    };
+                  }
+                  return {
+                    label: isAgent ? "View test-by-test results" : `${m} \u2014 View test-by-test results`,
+                    value: m
+                  };
+                }),
                 { label: "Exit", value: "__exit__" }
               ],
               onSelect: (v) => {
@@ -48588,7 +48722,7 @@ function SimulationsApp({ onBack }) {
     };
     if (simType === "text") {
       addIfMissing("OPENAI_API_KEY");
-      if (provider === "openrouter") {
+      if (provider === "openrouter" && !isAgentConnection) {
         addIfMissing("OPENROUTER_API_KEY");
       }
     } else if (simType === "voice") {
@@ -48701,7 +48835,6 @@ function SimulationsApp({ onBack }) {
     }
     Object.assign(env3, config.envVars);
     env3.PYTHONUNBUFFERED = "1";
-    const model = config.models[0] || "gpt-4.1";
     const cmdArgs = [
       ...bin.args,
       "simulations",
@@ -48710,12 +48843,11 @@ function SimulationsApp({ onBack }) {
       "-c",
       config.configPath,
       "-o",
-      config.outputDir,
-      "-m",
-      model,
-      "-p",
-      config.provider
+      config.outputDir
     ];
+    if (!isAgentConnection) {
+      cmdArgs.push("-m", config.models[0] || "gpt-4.1", "-p", config.provider);
+    }
     if (config.parallel > 1) {
       cmdArgs.push("-n", String(config.parallel));
     }
@@ -49007,7 +49139,7 @@ function SimulationsApp({ onBack }) {
     case "config-path":
       return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
         header,
-        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Text, { dimColor: true, children: "Path to a JSON config file containing system prompt, tools, personas, scenarios, and evaluation criteria." }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Text, { dimColor: true, children: "Path to a JSON config file containing system prompt, tools, personas, scenarios, and evaluators." }),
         initError ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Text, { color: "red", children: initError }) }) : null,
         /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(Box_default, { marginTop: 1, children: [
           /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Text, { children: "Config file: " }),
@@ -49621,6 +49753,78 @@ function getModeLabel(mode2) {
 function getAllProviders(mode2) {
   return mode2 === "tts" ? TTS_PROVIDERS : STT_PROVIDERS;
 }
+var RESERVED_METRIC_KEYS = /* @__PURE__ */ new Set(["wer", "ttfb", "count", "provider"]);
+function evaluatorNamesFromMetrics(data) {
+  return Object.keys(data).filter((k) => k.endsWith("_score")).map((k) => k.slice(0, -"_score".length)).filter((n) => !RESERVED_METRIC_KEYS.has(n));
+}
+function evaluatorScoresFromMetrics(data) {
+  const out = {};
+  for (const name of evaluatorNamesFromMetrics(data)) {
+    const v = data[`${name}_score`];
+    out[name] = typeof v === "number" ? v : Number(v) || 0;
+  }
+  return out;
+}
+function evaluatorMetaFromMetrics(data) {
+  const out = {};
+  for (const key of Object.keys(data)) {
+    if (!key.endsWith("_info")) continue;
+    const name = key.slice(0, -"_info".length);
+    if (RESERVED_METRIC_KEYS.has(name)) continue;
+    const info = data[key];
+    if (!info || typeof info !== "object") continue;
+    const i = info;
+    const type = i["type"] === "rating" ? "rating" : "binary";
+    const meta = { type };
+    if (type === "rating") {
+      if (typeof i["scale_min"] === "number")
+        meta.scale_min = i["scale_min"];
+      if (typeof i["scale_max"] === "number")
+        meta.scale_max = i["scale_max"];
+    }
+    out[name] = meta;
+  }
+  return out;
+}
+function evaluatorScoreColor(score, meta) {
+  if (meta?.type === "rating" && typeof score === "number" && typeof meta.scale_min === "number" && typeof meta.scale_max === "number") {
+    if (score <= meta.scale_min) return "red";
+    if (score >= meta.scale_max) return "green";
+    return "yellow";
+  }
+  const passed = score === true || score === "True" || score === 1;
+  const failed = score === false || score === "False" || score === 0;
+  return passed ? "green" : failed ? "red" : void 0;
+}
+function evaluatorNamesFromCsvHeaders(headers) {
+  return headers.filter((h) => h.endsWith("_score")).map((h) => h.slice(0, -"_score".length)).filter((n) => !RESERVED_METRIC_KEYS.has(n));
+}
+function unionEvaluatorNames(metrics) {
+  const seen = /* @__PURE__ */ new Set();
+  const ordered = [];
+  for (const m of metrics) {
+    for (const k of Object.keys(m)) {
+      if (RESERVED_METRIC_KEYS.has(k) || k === "provider" || k === "count") {
+        continue;
+      }
+      if (typeof m[k] === "number" && !seen.has(k)) {
+        seen.add(k);
+        ordered.push(k);
+      }
+    }
+  }
+  return ordered;
+}
+function formatEvaluatorCell(val, meta) {
+  if (meta?.type === "rating" && typeof val === "number") {
+    return String(Math.round(val));
+  }
+  if (val === true || val === "True" || val === 1) return "Pass";
+  if (val === false || val === "False" || val === 0) return "Fail";
+  if (typeof val === "number") return val.toFixed(2);
+  if (val === void 0 || val === null || val === "") return "-";
+  return String(val);
+}
 function ConfigLanguageStep({
   mode: mode2,
   onComplete,
@@ -49913,6 +50117,76 @@ function ConfigOutputStep({
     /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "Press enter to use default (./out), Esc to go back" }) })
   ] });
 }
+function ConfigFileStep({
+  mode: mode2,
+  onComplete,
+  onBack
+}) {
+  const [value, setValue] = (0, import_react25.useState)("");
+  const [error, setError] = (0, import_react25.useState)("");
+  use_input_default((_input, key) => {
+    if (key.escape) {
+      onBack();
+    }
+  });
+  const handleSubmit = (val) => {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      onComplete(void 0);
+      return;
+    }
+    if (!fs6.existsSync(trimmed)) {
+      setError(`File not found: ${trimmed}`);
+      return;
+    }
+    try {
+      const raw = fs6.readFileSync(trimmed, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object") {
+        setError("Config file must contain a JSON object");
+        return;
+      }
+    } catch (e) {
+      setError(`Invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    onComplete(trimmed);
+  };
+  const docsUrl = mode2 === "tts" ? "https://calibrate.artpark.ai/docs/cli/text-to-speech" : "https://calibrate.artpark.ai/docs/cli/speech-to-text";
+  return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
+    /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginBottom: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, color: "cyan", children: "Evaluator config (optional)" }) }),
+    /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { children: "Config JSON: " }),
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+        TextInput,
+        {
+          value,
+          onChange: (v) => {
+            setValue(v);
+            setError("");
+          },
+          onSubmit: handleSubmit
+        }
+      )
+    ] }),
+    error ? /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: "red", children: error }) }) : /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
+        "Path to a JSON file with a top-level",
+        " ",
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: "yellow", children: "evaluators" }),
+        " list. Leave empty to use the default ",
+        mode2 === "tts" ? "pronunciation" : "semantic_match",
+        " ",
+        "evaluator."
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
+        "See config format: ",
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: "blue", children: docsUrl })
+      ] })
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "Press enter to skip, Esc to go back" }) })
+  ] });
+}
 function KeySetupStep({
   mode: mode2,
   selectedProviders,
@@ -49924,7 +50198,7 @@ function KeySetupStep({
     const seen = /* @__PURE__ */ new Set();
     result.push({
       envVar: "OPENAI_API_KEY",
-      label: "OpenAI (LLM Judge)",
+      label: "OpenAI (Evaluators)",
       isFilePath: false,
       found: !!getCredential("OPENAI_API_KEY")
     });
@@ -50053,6 +50327,9 @@ function RunStep({
     if (config.overwrite) {
       args.push("--overwrite");
     }
+    if (config.configFile) {
+      args.push("-c", config.configFile);
+    }
     if (isLastProvider) {
       args.push("--leaderboard");
     }
@@ -50118,16 +50395,16 @@ function RunStep({
             "metrics.json"
           );
           const raw = JSON.parse(fs6.readFileSync(metricsPath, "utf-8"));
+          const evaluatorScores = evaluatorScoresFromMetrics(raw);
           if (config.mode === "tts") {
             metrics = {
-              llm_judge_score: raw.llm_judge_score ?? 0,
+              ...evaluatorScores,
               ttfb: raw.ttfb?.mean ?? raw.ttfb ?? 0
             };
           } else {
             metrics = {
               wer: raw.wer ?? 0,
-              string_similarity: raw.string_similarity ?? 0,
-              llm_judge_score: raw.llm_judge_score ?? 0
+              ...evaluatorScores
             };
           }
         } catch {
@@ -50175,27 +50452,27 @@ function RunStep({
   );
   function renderMetricSummary(state) {
     if (!state.metrics) return null;
+    const m = state.metrics;
+    const evalEntries = Object.entries(m).filter(
+      ([k]) => !RESERVED_METRIC_KEYS.has(k)
+    );
+    const parts = [];
     if (config.mode === "tts") {
-      return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
-        "llm_judge: ",
-        state.metrics.llm_judge_score?.toFixed(2),
-        "  ",
-        "ttfb: ",
-        state.metrics.ttfb?.toFixed(2),
-        "s"
-      ] });
+      for (const [name, val] of evalEntries) {
+        parts.push(`${name}: ${val?.toFixed(2)}`);
+      }
+      if (typeof m.ttfb === "number") {
+        parts.push(`ttfb: ${m.ttfb.toFixed(2)}s`);
+      }
     } else {
-      return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
-        "wer: ",
-        state.metrics.wer?.toFixed(2),
-        "  ",
-        "similarity: ",
-        state.metrics.string_similarity?.toFixed(2),
-        "  ",
-        "llm_judge: ",
-        state.metrics.llm_judge_score?.toFixed(2)
-      ] });
+      if (typeof m.wer === "number") {
+        parts.push(`wer: ${m.wer.toFixed(2)}`);
+      }
+      for (const [name, val] of evalEntries) {
+        parts.push(`${name}: ${val?.toFixed(2)}`);
+      }
     }
+    return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: parts.join("  ") });
   }
   return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
     /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginBottom: 1, children: [
@@ -50255,6 +50532,8 @@ function LeaderboardStep({ config }) {
   const audioProcessRef = (0, import_react25.useRef)(null);
   const MAX_VISIBLE_ROWS = 10;
   const [metrics, setMetrics] = (0, import_react25.useState)([]);
+  const [evaluatorMeta, setEvaluatorMeta] = (0, import_react25.useState)({});
+  const [expandedRows, setExpandedRows] = (0, import_react25.useState)(/* @__PURE__ */ new Set());
   (0, import_react25.useEffect)(() => {
     const results = [];
     for (const provider of config.providers) {
@@ -50276,10 +50555,11 @@ function LeaderboardStep({ config }) {
           count = csvContent.trim().split("\n").length - 1;
         } catch {
         }
+        const evaluatorScores = evaluatorScoresFromMetrics(data);
         if (config.mode === "tts") {
           results.push({
             provider,
-            llm_judge_score: data.llm_judge_score ?? 0,
+            ...evaluatorScores,
             ttfb: data.ttfb?.mean ?? data.ttfb ?? 0,
             count
           });
@@ -50287,8 +50567,7 @@ function LeaderboardStep({ config }) {
           results.push({
             provider,
             wer: data.wer ?? 0,
-            string_similarity: data.string_similarity ?? 0,
-            llm_judge_score: data.llm_judge_score ?? 0,
+            ...evaluatorScores,
             count
           });
         }
@@ -50341,7 +50620,8 @@ function LeaderboardStep({ config }) {
         const row = { id: "" };
         headers.forEach((h, idx) => {
           const val = values[idx] || "";
-          if (["wer", "string_similarity", "llm_judge_score", "ttfb"].includes(h)) {
+          const isNumericMetric = h === "wer" || h === "ttfb" || h.endsWith("_score");
+          if (isNumericMetric) {
             const num = parseFloat(val);
             row[h] = isNaN(num) ? val : num;
           } else {
@@ -50353,8 +50633,20 @@ function LeaderboardStep({ config }) {
       setProviderResults(rows);
       setScrollOffset(0);
       setSelectedRowIdx(0);
+      setExpandedRows(/* @__PURE__ */ new Set());
     } catch {
       setProviderResults([]);
+    }
+    try {
+      const metricsPath = path5.join(
+        config.outputDir,
+        selectedProvider,
+        "metrics.json"
+      );
+      const data = JSON.parse(fs6.readFileSync(metricsPath, "utf-8"));
+      setEvaluatorMeta(evaluatorMetaFromMetrics(data));
+    } catch {
+      setEvaluatorMeta({});
     }
   }, [selectedProvider, config.outputDir]);
   const playAudio = (rowId) => {
@@ -50453,11 +50745,34 @@ function LeaderboardStep({ config }) {
       }
     }
     if (view === "provider-detail" && config.mode !== "tts") {
-      if (key.upArrow && scrollOffset > 0) {
-        setScrollOffset((o) => o - 1);
+      if (key.upArrow) {
+        setSelectedRowIdx((idx) => {
+          const newIdx = Math.max(0, idx - 1);
+          if (newIdx < scrollOffset) {
+            setScrollOffset(newIdx);
+          }
+          return newIdx;
+        });
       }
-      if (key.downArrow && scrollOffset < providerResults.length - MAX_VISIBLE_ROWS) {
-        setScrollOffset((o) => o + 1);
+      if (key.downArrow) {
+        setSelectedRowIdx((idx) => {
+          const newIdx = Math.min(providerResults.length - 1, idx + 1);
+          if (newIdx >= scrollOffset + MAX_VISIBLE_ROWS) {
+            setScrollOffset(newIdx - MAX_VISIBLE_ROWS + 1);
+          }
+          return newIdx;
+        });
+      }
+      if (key.return || input === " ") {
+        setExpandedRows((prev) => {
+          const next = new Set(prev);
+          if (next.has(selectedRowIdx)) {
+            next.delete(selectedRowIdx);
+          } else {
+            next.add(selectedRowIdx);
+          }
+          return next;
+        });
       }
     }
   });
@@ -50476,6 +50791,7 @@ function LeaderboardStep({ config }) {
       scrollOffset + MAX_VISIBLE_ROWS
     );
     const truncate = (s, max) => s.length > max ? s.slice(0, max - 1) + "\u2026" : s;
+    const detailEvaluatorNames = providerResults.length > 0 ? evaluatorNamesFromCsvHeaders(Object.keys(providerResults[0])) : [];
     return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
       /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginBottom: 1, children: [
         /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { bold: true, color: "cyan", children: [
@@ -50507,18 +50823,14 @@ function LeaderboardStep({ config }) {
               " | ",
               "TTFB".padStart(8)
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { bold: true, children: [
-              " | ",
-              "LLM Judge".padStart(10)
-            ] })
+            detailEvaluatorNames.map((name) => /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: " | " + truncate(name, 10).padStart(10) }, name))
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: " " + "-".repeat(6) + "-+-" + "-".repeat(10) + "-+-" + "-".repeat(28) + "-+-" + "-".repeat(8) + "-+-" + "-".repeat(10) }),
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: " " + "-".repeat(6) + "-+-" + "-".repeat(10) + "-+-" + "-".repeat(28) + "-+-" + "-".repeat(8) + detailEvaluatorNames.map(() => "-+-" + "-".repeat(10)).join("") }),
           visibleRows.map((r, idx) => {
             const absoluteIdx = scrollOffset + idx;
             const isSelected = absoluteIdx === selectedRowIdx;
             const rowId = String(r.id || "");
             const isPlaying = playingAudio === rowId;
-            const llmJudge = r.llm_judge_score === true || r.llm_judge_score === "True" || r.llm_judge_score === 1 ? "Pass" : r.llm_judge_score === false || r.llm_judge_score === "False" || r.llm_judge_score === 0 ? "Fail" : String(r.llm_judge_score || "-");
             return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
               /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
                 Text,
@@ -50538,7 +50850,17 @@ function LeaderboardStep({ config }) {
               /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: isSelected ? "cyan" : void 0, children: " | " + truncate(rowId, 10).padEnd(10) }),
               /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: isSelected ? "cyan" : void 0, children: " | " + truncate(String(r.text || ""), 28).padEnd(28) }),
               /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: isSelected ? "cyan" : void 0, children: " | " + (typeof r.ttfb === "number" ? r.ttfb.toFixed(2) + "s" : "-").padStart(8) }),
-              /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: isSelected ? "cyan" : void 0, children: " | " + llmJudge.padStart(10) })
+              detailEvaluatorNames.map((name) => /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+                Text,
+                {
+                  color: isSelected ? "cyan" : void 0,
+                  children: " | " + formatEvaluatorCell(
+                    r[`${name}_score`],
+                    evaluatorMeta[name]
+                  ).padStart(10)
+                },
+                name
+              ))
             ] }, idx);
           })
         ] }) : /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
@@ -50549,27 +50871,28 @@ function LeaderboardStep({ config }) {
               { key: "gt", label: "Ground Truth", width: 25 },
               { key: "pred", label: "Prediction", width: 25 },
               { key: "wer", label: "WER", width: 6, align: "right" },
-              {
-                key: "similarity",
-                label: "Sim",
-                width: 6,
+              ...detailEvaluatorNames.map((name) => ({
+                key: name,
+                label: name.length > 10 ? name.slice(0, 10) : name,
+                width: Math.max(6, Math.min(name.length, 10)),
                 align: "right"
-              },
-              {
-                key: "llm_judge",
-                label: "Judge",
-                width: 6,
-                align: "right"
-              }
+              }))
             ],
-            data: visibleRows.map((r) => ({
-              id: truncate(String(r.id || ""), 10),
-              gt: truncate(String(r.gt || ""), 25),
-              pred: truncate(String(r.pred || ""), 25),
-              wer: typeof r.wer === "number" ? r.wer.toFixed(2) : "-",
-              similarity: typeof r.string_similarity === "number" ? r.string_similarity.toFixed(2) : "-",
-              llm_judge: r.llm_judge_score === true || r.llm_judge_score === "True" || r.llm_judge_score === 1 ? "Pass" : r.llm_judge_score === false || r.llm_judge_score === "False" || r.llm_judge_score === 0 ? "Fail" : String(r.llm_judge_score || "-")
-            }))
+            data: visibleRows.map((r) => {
+              const row = {
+                id: truncate(String(r.id || ""), 10),
+                gt: truncate(String(r.gt || ""), 25),
+                pred: truncate(String(r.pred || ""), 25),
+                wer: typeof r.wer === "number" ? r.wer.toFixed(2) : "-"
+              };
+              for (const name of detailEvaluatorNames) {
+                row[name] = formatEvaluatorCell(
+                  r[`${name}_score`],
+                  evaluatorMeta[name]
+                );
+              }
+              return row;
+            })
           }
         ),
         providerResults.length > MAX_VISIBLE_ROWS && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
@@ -50583,7 +50906,7 @@ function LeaderboardStep({ config }) {
           " ",
           "of ",
           providerResults.length,
-          config.mode === "tts" ? " | \u2191\u2193 navigate, Enter/p play, s stop" : " | Use \u2191\u2193 to scroll"
+          config.mode === "tts" ? " | \u2191\u2193 navigate, Enter/p play, s stop" : " | \u2191\u2193 navigate, Enter to expand/collapse"
         ] }) }),
         config.mode === "tts" && providerResults.length <= MAX_VISIBLE_ROWS && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, children: [
           /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "\u2191\u2193 navigate | " }),
@@ -50594,28 +50917,124 @@ function LeaderboardStep({ config }) {
           /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: "yellow", children: "s" }),
           /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: " stop" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, dimColor: true, children: "LLM Judge Reasoning:" }),
+        config.mode === "tts" && detailEvaluatorNames.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, dimColor: true, children: "Evaluator Reasoning:" }),
           visibleRows.map((r, idx) => {
-            const reasoning = String(r.llm_judge_reasoning || "");
-            if (!reasoning || reasoning === "-") return null;
-            const passed = r.llm_judge_score === true || r.llm_judge_score === "True" || r.llm_judge_score === 1;
+            const blocks = [];
+            for (const name of detailEvaluatorNames) {
+              const reasoning = String(r[`${name}_reasoning`] || "");
+              if (!reasoning || reasoning === "-") continue;
+              const score = r[`${name}_score`] ?? "-";
+              const color = evaluatorScoreColor(
+                score,
+                evaluatorMeta[name]
+              );
+              blocks.push({ name, reasoning, color, score });
+            }
+            if (blocks.length === 0) return null;
             return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
-                /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { color: passed ? "green" : "red", children: [
-                  "[",
-                  String(r.id || idx + 1),
-                  "]",
-                  " "
-                ] }),
-                /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { color: passed ? "green" : "red", children: passed ? "Pass" : "Fail" })
+              /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
+                "[",
+                String(r.id || idx + 1),
+                "]"
               ] }),
-              /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginLeft: 2, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { wrap: "wrap", children: reasoning }) })
+              blocks.map((b) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginLeft: 2, flexDirection: "column", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { color: b.color, children: [
+                  b.name,
+                  ":",
+                  " ",
+                  formatEvaluatorCell(
+                    b.score,
+                    evaluatorMeta[b.name]
+                  )
+                ] }) }),
+                /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginLeft: 2, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { wrap: "wrap", children: b.reasoning }) })
+              ] }, b.name))
             ] }, idx);
+          })
+        ] }),
+        config.mode !== "tts" && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, dimColor: true, children: "Row Details:" }),
+          visibleRows.map((r, idx) => {
+            const absoluteIdx = scrollOffset + idx;
+            const isSelected = absoluteIdx === selectedRowIdx;
+            const isExpanded = expandedRows.has(absoluteIdx);
+            const blocks = [];
+            for (const name of detailEvaluatorNames) {
+              const reasoning = String(r[`${name}_reasoning`] || "");
+              if (!reasoning || reasoning === "-") continue;
+              const score = r[`${name}_score`] ?? "-";
+              const color = evaluatorScoreColor(
+                score,
+                evaluatorMeta[name]
+              );
+              blocks.push({ name, reasoning, color, score });
+            }
+            const hasBlocks = blocks.length > 0;
+            return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(
+              Box_default,
+              {
+                marginTop: 1,
+                flexDirection: "column",
+                children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+                      Text,
+                      {
+                        color: isSelected ? "cyan" : void 0,
+                        bold: isSelected,
+                        children: (isSelected ? "> " : "  ") + `[${String(r.id || idx + 1)}]`
+                      }
+                    ),
+                    hasBlocks && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { dimColor: true, children: [
+                      " ",
+                      isExpanded ? "\u25BC" : "\u25B6"
+                    ] })
+                  ] }),
+                  /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginLeft: 4, flexDirection: "column", children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { bold: true, dimColor: true, children: [
+                        "GT:",
+                        " "
+                      ] }),
+                      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { wrap: "wrap", children: String(r.gt || "") })
+                    ] }),
+                    /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { bold: true, dimColor: true, children: [
+                        "Pred:",
+                        " "
+                      ] }),
+                      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { wrap: "wrap", children: String(r.pred || "") })
+                    ] }),
+                    isExpanded && hasBlocks && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, flexDirection: "column", children: blocks.map((b) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(
+                      Box_default,
+                      {
+                        flexDirection: "column",
+                        marginTop: 1,
+                        children: [
+                          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Text, { color: b.color, children: [
+                            b.name,
+                            ":",
+                            " ",
+                            formatEvaluatorCell(
+                              b.score,
+                              evaluatorMeta[b.name]
+                            )
+                          ] }) }),
+                          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginLeft: 2, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { wrap: "wrap", children: b.reasoning }) })
+                        ]
+                      },
+                      b.name
+                    )) })
+                  ] })
+                ]
+              },
+              absoluteIdx
+            );
           })
         ] })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: config.mode === "tts" ? "q/Esc back | \u2191\u2193 navigate | Enter/p play | s stop" : "Press q or Esc to go back to leaderboard" }) })
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: config.mode === "tts" ? "q/Esc back | \u2191\u2193 navigate | Enter/p play | s stop" : "q/Esc back | \u2191\u2193 navigate | Enter to expand/collapse" }) })
     ] });
   }
   return /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { flexDirection: "column", padding: 1, children: [
@@ -50623,120 +51042,109 @@ function LeaderboardStep({ config }) {
       getModeLabel(config.mode),
       " Leaderboard"
     ] }) }),
-    config.mode === "tts" ? /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-      Table,
-      {
-        columns: [
-          { key: "provider", label: "Provider", width: 14 },
-          { key: "llm_judge", label: "LLM Judge", width: 10, align: "right" },
-          { key: "ttfb", label: "TTFB (avg)", width: 11, align: "right" },
-          { key: "count", label: "Count", width: 6, align: "right" }
-        ],
-        data: metrics.map((m) => ({
-          provider: m.provider,
-          llm_judge: m.llm_judge_score.toFixed(2),
-          ttfb: m.ttfb.toFixed(2) + "s",
-          count: String(m.count)
-        }))
-      }
-    ) : /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-      Table,
-      {
-        columns: [
-          { key: "provider", label: "Provider", width: 14 },
-          { key: "wer", label: "WER", width: 8, align: "right" },
-          {
-            key: "similarity",
-            label: "Similarity",
-            width: 11,
-            align: "right"
-          },
-          { key: "llm_judge", label: "LLM Judge", width: 10, align: "right" },
-          { key: "count", label: "Count", width: 6, align: "right" }
-        ],
-        data: metrics.map((m) => ({
-          provider: m.provider,
-          wer: m.wer.toFixed(2),
-          similarity: m.string_similarity.toFixed(2),
-          llm_judge: m.llm_judge_score.toFixed(2),
-          count: String(m.count)
-        }))
-      }
-    ),
-    config.mode === "tts" ? /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(import_jsx_runtime4.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "LLM Judge Score" }),
+    (() => {
+      const lbEvaluatorNames = unionEvaluatorNames(metrics);
+      const evaluatorColumns = lbEvaluatorNames.map((name) => ({
+        key: name,
+        label: name.length > 12 ? name.slice(0, 12) : name,
+        width: Math.max(8, Math.min(name.length, 12)),
+        align: "right"
+      }));
+      const evaluatorCells = (m) => {
+        const out = {};
+        for (const name of lbEvaluatorNames) {
+          const v = m[name];
+          out[name] = typeof v === "number" ? v.toFixed(2) : "-";
+        }
+        return out;
+      };
+      return config.mode === "tts" ? /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+        Table,
+        {
+          columns: [
+            { key: "provider", label: "Provider", width: 14 },
+            ...evaluatorColumns,
+            { key: "ttfb", label: "TTFB (avg)", width: 11, align: "right" },
+            { key: "count", label: "Count", width: 6, align: "right" }
+          ],
+          data: metrics.map((m) => ({
+            provider: m.provider,
+            ...evaluatorCells(m),
+            ttfb: typeof m.ttfb === "number" ? m.ttfb.toFixed(2) + "s" : "-",
+            count: String(m.count)
+          }))
+        }
+      ) : /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+        Table,
+        {
+          columns: [
+            { key: "provider", label: "Provider", width: 14 },
+            { key: "wer", label: "WER", width: 8, align: "right" },
+            ...evaluatorColumns,
+            { key: "count", label: "Count", width: 6, align: "right" }
+          ],
+          data: metrics.map((m) => ({
+            provider: m.provider,
+            wer: typeof m.wer === "number" ? m.wer.toFixed(2) : "-",
+            ...evaluatorCells(m),
+            count: String(m.count)
+          }))
+        }
+      );
+    })(),
+    (() => {
+      const chartEvaluatorNames = unionEvaluatorNames(metrics);
+      const evaluatorCharts = chartEvaluatorNames.map((name) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: name }),
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
           BarChart,
           {
             data: metrics.map((m) => ({
               label: m.provider,
-              value: m.llm_judge_score,
+              value: typeof m[name] === "number" ? m[name] : 0,
               color: "green"
             }))
           }
         )
-      ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "TTFB " }),
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "(lower is better)" })
+      ] }, name));
+      return config.mode === "tts" ? /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(import_jsx_runtime4.Fragment, { children: [
+        evaluatorCharts,
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "TTFB " }),
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "(lower is better)" })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+            BarChart,
+            {
+              data: [...metrics].sort((a, b) => a.ttfb - b.ttfb).map((m) => ({
+                label: m.provider,
+                value: m.ttfb,
+                color: "yellow"
+              }))
+            }
+          )
+        ] })
+      ] }) : /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(import_jsx_runtime4.Fragment, { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "Word Error Rate " }),
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "(lower is better)" })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+            BarChart,
+            {
+              data: [...metrics].sort((a, b) => a.wer - b.wer).map((m) => ({
+                label: m.provider,
+                value: m.wer,
+                color: "yellow"
+              }))
+            }
+          )
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-          BarChart,
-          {
-            data: [...metrics].sort((a, b) => a.ttfb - b.ttfb).map((m) => ({
-              label: m.provider,
-              value: m.ttfb,
-              color: "yellow"
-            }))
-          }
-        )
-      ] })
-    ] }) : /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(import_jsx_runtime4.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "Word Error Rate " }),
-          /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "(lower is better)" })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-          BarChart,
-          {
-            data: [...metrics].sort((a, b) => a.wer - b.wer).map((m) => ({
-              label: m.provider,
-              value: m.wer,
-              color: "yellow"
-            }))
-          }
-        )
-      ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "String Similarity" }),
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-          BarChart,
-          {
-            data: metrics.map((m) => ({
-              label: m.provider,
-              value: m.string_similarity,
-              color: "green"
-            }))
-          }
-        )
-      ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "LLM Judge Score" }),
-        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
-          BarChart,
-          {
-            data: metrics.map((m) => ({
-              label: m.provider,
-              value: m.llm_judge_score,
-              color: "green"
-            }))
-          }
-        )
-      ] })
-    ] }),
+        evaluatorCharts
+      ] });
+    })(),
     /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(Box_default, { marginTop: 1, flexDirection: "column", children: [
       /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { dimColor: true, children: "\u2500".repeat(50) }),
       /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Box_default, { marginTop: 1, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Text, { bold: true, children: "View Provider Details" }) }),
@@ -50921,9 +51329,21 @@ function EvalApp({
           providers: config.providers,
           onComplete: (dir, overwrite) => {
             setConfig((c) => ({ ...c, outputDir: dir, overwrite }));
-            setStep("setup-keys");
+            setStep("config-file");
           },
           onBack: () => setStep("config-input")
+        }
+      );
+    case "config-file":
+      return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+        ConfigFileStep,
+        {
+          mode: config.mode,
+          onComplete: (configFile) => {
+            setConfig((c) => ({ ...c, configFile }));
+            setStep("setup-keys");
+          },
+          onBack: () => setStep("config-output")
         }
       );
     case "setup-keys":
@@ -50936,7 +51356,7 @@ function EvalApp({
             setConfig((c) => ({ ...c, envVars }));
             setStep("running");
           },
-          onBack: () => setStep("config-output")
+          onBack: () => setStep("config-file")
         }
       );
     case "running":

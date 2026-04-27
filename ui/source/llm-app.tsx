@@ -19,10 +19,92 @@ import {
   type HistoryMessage,
   type ToolCall,
   type TestResult,
+  type EvaluatorAggregate,
   MAX_PARALLEL_MODELS,
   OPENAI_MODEL_EXAMPLES,
   OPENROUTER_MODEL_EXAMPLES,
 } from "./llm-types.js";
+
+// Parse the per-evaluator aggregate block from a model's metrics.json.
+// Returns ``undefined`` when the file is missing/malformed or has no
+// ``criteria``/``tool_calls`` blocks. Extracted so both the live progress
+// display and the leaderboard view share one parser.
+//
+// Tool-call aggregates are surfaced alongside response evaluators as columns
+// like ``tool:<name>`` (binary, pass-rate %), so the leaderboard table shows
+// tool call accuracy next to criteria pass-rates without needing a separate
+// section.
+function parseEvaluatorsFromMetrics(
+  metricsJsonPath: string
+): Record<string, EvaluatorAggregate> | undefined {
+  try {
+    if (!fs.existsSync(metricsJsonPath)) return undefined;
+    const mj = JSON.parse(fs.readFileSync(metricsJsonPath, "utf-8"));
+    const evaluators: Record<string, EvaluatorAggregate> = {};
+
+    const crit = mj?.criteria;
+    if (crit && typeof crit === "object") {
+      for (const [name, agg] of Object.entries(
+        crit as Record<string, Record<string, unknown>>
+      )) {
+        if (agg?.["type"] === "binary") {
+          const rate =
+            typeof agg["pass_rate"] === "number"
+              ? (agg["pass_rate"] as number)
+              : 0;
+          evaluators[name] = {
+            type: "binary",
+            display: `${rate.toFixed(1)}%`,
+            sortValue: rate,
+          };
+        } else if (agg?.["type"] === "rating") {
+          const mean =
+            typeof agg["mean"] === "number" ? (agg["mean"] as number) : 0;
+          const hi = agg["scale_max"] ?? 5;
+          evaluators[name] = {
+            type: "rating",
+            display: `${mean.toFixed(2)}/${hi}`,
+            sortValue: mean,
+          };
+        }
+      }
+    }
+
+    const tools = mj?.tool_calls;
+    if (tools && typeof tools === "object") {
+      for (const [name, agg] of Object.entries(
+        tools as Record<string, Record<string, unknown>>
+      )) {
+        const rate =
+          typeof agg?.["pass_rate"] === "number"
+            ? (agg["pass_rate"] as number)
+            : 0;
+        evaluators[`tool:${name}`] = {
+          type: "binary",
+          display: `${rate.toFixed(1)}%`,
+          sortValue: rate,
+        };
+      }
+    }
+
+    return Object.keys(evaluators).length > 0 ? evaluators : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Format the evaluators dict as a single inline summary line for a finished
+// model row in the live progress display, e.g. ``relevance: 80.0% · tone: 4.20/5 (≥1)``.
+// Returns "Done" when no evaluator data is available (e.g. the run had only
+// tool_call test cases, which aren't surfaced in the criteria block).
+function formatEvaluatorSummary(
+  evaluators: Record<string, EvaluatorAggregate> | undefined
+): string {
+  if (!evaluators || Object.keys(evaluators).length === 0) return "Done";
+  return Object.entries(evaluators)
+    .map(([name, ev]) => `${name}: ${ev.display}`)
+    .join(" · ");
+}
 
 // ─── Main Component ──────────────────────────────────────────
 export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
@@ -87,11 +169,9 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
   const [metrics, setMetrics] = useState<
     Array<{
       model: string;
-      passed: number;
-      failed: number;
-      total: number;
-      pass_rate: number;
-      overall?: number;
+      total?: number;
+      passed?: number;
+      evaluators?: Record<string, EvaluatorAggregate>;
     }>
   >([]);
 
@@ -229,7 +309,7 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
   // ── Check API keys ──
   function checkApiKeys(provider: string) {
     const needed: string[] = [];
-    // Always need OPENAI_API_KEY for LLM judge
+    // Always need OPENAI_API_KEY for evaluators
     if (!getCredential("OPENAI_API_KEY")) {
       needed.push("OPENAI_API_KEY");
     }
@@ -281,6 +361,18 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
     setPhase("eval");
     setRunningCount(0);
     setNextModelIdx(0);
+
+    // Clear the shared output-dir `logs` file once at the start of the run.
+    // Each per-model subprocess we spawn appends (CALIBRATE_LLM_LOG_APPEND=1)
+    // so all model runs end up combined in a single top-level log instead of
+    // racing to truncate each other.
+    try {
+      const sharedLog = path.join(config.outputDir, "logs");
+      if (fs.existsSync(sharedLog)) fs.unlinkSync(sharedLog);
+    } catch {
+      // best-effort: if we cannot clear the file we still proceed; subprocesses
+      // will append to whatever's there.
+    }
   }, [step]);
 
   // ── Start a single model evaluation ──
@@ -300,6 +392,10 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
     }
     Object.assign(env, config.envVars);
     env.PYTHONUNBUFFERED = "1";
+    // Tell benchmark.py to append to the shared <output_dir>/logs file instead
+    // of truncating it, so concurrent per-model subprocesses don't overwrite
+    // each other's output. The UI clears this file once before the run begins.
+    env.CALIBRATE_LLM_LOG_APPEND = "1";
 
     const cmdArgs = config.agentUrl
       ? [
@@ -377,6 +473,15 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
             ).length;
             const total = results.length;
             metricsData = { passed, failed: total - passed, total };
+          }
+
+          // Also load per-evaluator aggregate so the live progress row can
+          // surface per-evaluator stats instead of a generic pass count.
+          const evaluators = parseEvaluatorsFromMetrics(
+            path.join(getResultsDir(model), "metrics.json")
+          );
+          if (evaluators) {
+            metricsData = { ...(metricsData ?? {}), evaluators };
           }
         } catch {
           // Ignore errors reading metrics
@@ -527,56 +632,40 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
       : config.models;
 
     for (const model of metricKeys) {
-      try {
-        const resultsPath = path.join(getResultsDir(model), "results.json");
-        if (fs.existsSync(resultsPath)) {
-          const data = JSON.parse(fs.readFileSync(resultsPath, "utf-8"));
-          const passed = data.filter(
-            (r: { metrics?: { passed?: boolean } }) => r.metrics?.passed
-          ).length;
-          const total = data.length;
-          const failed = total - passed;
-          const pass_rate = total > 0 ? (passed / total) * 100 : 0;
-          results.push({ model, passed, failed, total, pass_rate });
-        }
-      } catch {
-        // Skip models with no results
-      }
-    }
-
-    // Try to read overall scores from leaderboard CSV
-    try {
-      const lbCsvPath = path.join(
-        config.outputDir,
-        "leaderboard",
-        "llm_leaderboard.csv"
+      const resultsPath = path.join(getResultsDir(model), "results.json");
+      if (!fs.existsSync(resultsPath)) continue;
+      const evaluators = parseEvaluatorsFromMetrics(
+        path.join(getResultsDir(model), "metrics.json")
       );
-      if (fs.existsSync(lbCsvPath)) {
-        const lines = fs.readFileSync(lbCsvPath, "utf-8").trim().split("\n");
-        if (lines.length > 1) {
-          const headers = lines[0]!.split(",").map((h) => h.trim());
-          const overallIdx = headers.findIndex(
-            (h) => h.toLowerCase() === "overall"
-          );
-          const modelIdx = headers.findIndex(
-            (h) => h.toLowerCase() === "model" || h.toLowerCase() === "provider"
-          );
 
-          if (overallIdx >= 0 && modelIdx >= 0) {
-            for (let i = 1; i < lines.length; i++) {
-              const vals = lines[i]!.split(",");
-              const modelName = vals[modelIdx]?.trim() || "";
-              const overall = parseFloat(vals[overallIdx] || "0") || 0;
-              const result = results.find((r) => r.model === modelName);
-              if (result) {
-                result.overall = overall;
-              }
-            }
+      // Read total/passed counts so the leaderboard can show overall test
+      // pass rate alongside the per-evaluator columns. Prefer metrics.json
+      // (canonical), fall back to counting results.json entries.
+      let total: number | undefined;
+      let passed: number | undefined;
+      try {
+        const metricsPath = path.join(getResultsDir(model), "metrics.json");
+        if (fs.existsSync(metricsPath)) {
+          const mj = JSON.parse(fs.readFileSync(metricsPath, "utf-8"));
+          if (typeof mj?.total === "number") total = mj.total;
+          if (typeof mj?.passed === "number") passed = mj.passed;
+        }
+        if (total === undefined || passed === undefined) {
+          const data = JSON.parse(fs.readFileSync(resultsPath, "utf-8"));
+          if (Array.isArray(data)) {
+            total = total ?? data.length;
+            passed =
+              passed ??
+              data.filter(
+                (r: { metrics?: { passed?: boolean } }) => r.metrics?.passed
+              ).length;
           }
         }
+      } catch {
+        // Best-effort; missing counts just render as "-".
       }
-    } catch {
-      // Ignore leaderboard parse errors
+
+      results.push({ model, total, passed, evaluators });
     }
 
     setMetrics(results);
@@ -592,6 +681,11 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
 
   // ── Load model results when selected ──
   useEffect(() => {
+    // Always clear previously-loaded results before doing anything else so
+    // navigating from a successful model into a failed one never flashes
+    // (or persists) the previous model's test data.
+    setModelResults([]);
+    setScrollOffset(0);
     if (!selectedModel) return;
     try {
       const resultsPath = path.join(getResultsDir(selectedModel), "results.json");
@@ -605,7 +699,7 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                 history?: HistoryMessage[];
                 evaluation?: {
                   type?: string;
-                  criteria?: string;
+                  criteria?: unknown;
                   tool_calls?: ToolCall[];
                 };
               };
@@ -613,7 +707,14 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                 response?: string;
                 tool_calls?: ToolCall[];
               };
-              metrics?: { passed?: boolean; reasoning?: string };
+              metrics?: {
+                passed?: boolean;
+                reasoning?: string;
+                judge_results?: Record<
+                  string,
+                  { match?: boolean; score?: number; reasoning?: string }
+                >;
+              };
             },
             idx: number
           ) => {
@@ -625,11 +726,28 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
               actualOutput = formatToolCalls(r.output.tool_calls);
             }
 
-            // Build evaluation criteria string
+            // Build evaluation criteria string. Under the new evaluators
+            // model, ``evaluation.criteria`` is a list of names (strings or
+            // ``{name}`` dicts). Old configs used a single string; preserve
+            // that as a fallback.
             let evaluationCriteria = "";
             const evalType = r.test_case?.evaluation?.type || "";
             if (evalType === "response") {
-              evaluationCriteria = r.test_case?.evaluation?.criteria || "";
+              const raw = r.test_case?.evaluation?.criteria;
+              if (Array.isArray(raw)) {
+                evaluationCriteria = raw
+                  .map((c) => {
+                    if (typeof c === "string") return c;
+                    if (c && typeof c === "object" && "name" in c) {
+                      return String((c as { name: unknown }).name);
+                    }
+                    return "";
+                  })
+                  .filter(Boolean)
+                  .join(", ");
+              } else if (typeof raw === "string") {
+                evaluationCriteria = raw;
+              }
             } else if (
               evalType === "tool_call" &&
               r.test_case?.evaluation?.tool_calls
@@ -647,16 +765,15 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
               actualOutput,
               passed: r.metrics?.passed || false,
               reasoning: r.metrics?.reasoning || "",
+              judgeResults: r.metrics?.judge_results,
             };
           }
         );
         setModelResults(results);
-        setScrollOffset(0);
-      } else {
-        setModelResults([]);
       }
     } catch {
-      setModelResults([]);
+      // Leave modelResults empty so the model-detail view falls into the
+      // "no results" / failure path rather than displaying stale data.
     }
   }, [selectedModel, config.outputDir]);
 
@@ -1209,8 +1326,8 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                   <Box><Text> </Text><Spinner /><Text> </Text></Box>
                 )}
               </Box>
-              {singleState.status === "done" && singleState.metrics ? (
-                <Text dimColor>{singleState.metrics.passed}/{singleState.metrics.total} passed</Text>
+              {singleState.status === "done" ? (
+                <Text dimColor>{formatEvaluatorSummary(singleState.metrics?.evaluators)}</Text>
               ) : singleState.status === "running" ? (
                 <Text color="cyan">Running tests...</Text>
               ) : singleState.status === "error" ? (
@@ -1245,9 +1362,9 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                 <Box width={30}>
                   <Text bold={state.status === "running"}>{model}</Text>
                 </Box>
-                {state.status === "done" && state.metrics ? (
+                {state.status === "done" ? (
                   <Text dimColor>
-                    {state.metrics.passed}/{state.metrics.total} passed
+                    {formatEvaluatorSummary(state.metrics?.evaluators)}
                   </Text>
                 ) : state.status === "running" ? (
                   <Text color="cyan">Running...</Text>
@@ -1345,8 +1462,78 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
           : ["agent"]
         : config.models;
 
+      // Classify each leaderboard key as succeeded vs failed using the
+      // ground truth on disk: a successful run always writes results.json.
+      // We also fall back to modelStates for the in-session error string.
+      const isModelFailed = (m: string): boolean => {
+        const resultsPath = path.join(getResultsDir(m), "results.json");
+        if (fs.existsSync(resultsPath)) return false;
+        // No results.json — either still running (handled elsewhere) or
+        // the subprocess errored out before writing any.
+        return modelStates[m]?.status !== "running";
+      };
+
       // Model Detail View
       if (view === "model-detail" && selectedModel) {
+        const failed = isModelFailed(selectedModel);
+
+        // Failed model: show captured error output instead of empty test
+        // results. We never want to fall through into the test-rendering
+        // branch (which would either say "No results found" or — worse —
+        // display whichever model the user previously inspected).
+        if (failed) {
+          const errorLogs = (modelStates[selectedModel]?.logs ?? []).map(
+            (l) => stripAnsi(l)
+          );
+          return (
+            <Box flexDirection="column" padding={1}>
+              <Box marginBottom={1}>
+                <Text bold color="cyan">
+                  {selectedModel}
+                </Text>
+                <Text dimColor> — </Text>
+                <Text bold color="red">
+                  Run Failed
+                </Text>
+              </Box>
+              <Box marginBottom={1}>
+                <Text>
+                  No results were produced for this model. The
+                  {" "}<Text color="cyan">calibrate llm</Text>{" "}
+                  subprocess exited with an error.
+                </Text>
+              </Box>
+              <Box flexDirection="column" marginBottom={1}>
+                <Text bold dimColor>
+                  Last subprocess output:
+                </Text>
+                <Box
+                  flexDirection="column"
+                  marginTop={1}
+                  borderStyle="single"
+                  borderColor="red"
+                  paddingX={1}
+                >
+                  {errorLogs.length > 0 ? (
+                    errorLogs.map((line, i) => (
+                      <Text key={i} wrap="wrap">
+                        {line}
+                      </Text>
+                    ))
+                  ) : (
+                    <Text dimColor>
+                      (no output captured — try re-running this model)
+                    </Text>
+                  )}
+                </Box>
+              </Box>
+              <Box marginTop={1}>
+                <Text dimColor>Press q or Esc to go back to leaderboard</Text>
+              </Box>
+            </Box>
+          );
+        }
+
         const visibleRows = modelResults.slice(
           scrollOffset,
           scrollOffset + MAX_VISIBLE_ROWS
@@ -1379,19 +1566,12 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                     borderColor={r.passed ? "green" : "red"}
                     paddingX={1}
                   >
-                    {/* Header with test ID and pass/fail */}
+                    {/* Test ID header with overall pass/fail indicator. */}
                     <Box marginBottom={1}>
-                      <Text bold>Test {r.id}</Text>
-                      <Text> </Text>
-                      {r.passed ? (
-                        <Text color="green" bold>
-                          ✓ Pass
-                        </Text>
-                      ) : (
-                        <Text color="red" bold>
-                          ✗ Fail
-                        </Text>
-                      )}
+                      <Text bold>Test {r.id} </Text>
+                      <Text bold color={r.passed ? "green" : "red"}>
+                        {r.passed ? "✓ Pass" : "✗ Fail"}
+                      </Text>
                     </Box>
 
                     {/* History */}
@@ -1413,10 +1593,10 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                       )}
                     </Box>
 
-                    {/* Criteria */}
+                    {/* Evaluators */}
                     <Box flexDirection="column" marginBottom={1}>
                       <Text bold dimColor>
-                        Criteria ({r.evaluationType || "unknown"}):
+                        Evaluators ({r.evaluationType || "unknown"}):
                       </Text>
                       <Box marginLeft={1}>
                         <Text wrap="wrap">
@@ -1437,15 +1617,57 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
                       </Box>
                     </Box>
 
+                    {/* Per-evaluator judge results */}
+                    {r.judgeResults &&
+                      Object.keys(r.judgeResults).length > 0 && (
+                        <Box flexDirection="column" marginBottom={1}>
+                          <Text bold dimColor>
+                            Evaluator Results:
+                          </Text>
+                          {Object.entries(r.judgeResults).map(([name, ev]) => {
+                            const isBinary = typeof ev?.match === "boolean";
+                            const isRating = typeof ev?.score === "number";
+                            const color = isBinary
+                              ? ev?.match
+                                ? "green"
+                                : "red"
+                              : undefined;
+                            const label = isBinary
+                              ? ev?.match
+                                ? "Pass"
+                                : "Fail"
+                              : isRating
+                              ? String(ev?.score)
+                              : "-";
+                            return (
+                              <Box
+                                key={name}
+                                flexDirection="column"
+                                marginLeft={1}
+                                marginTop={1}
+                              >
+                                <Box>
+                                  <Text bold>{name}: </Text>
+                                  <Text color={color}>{label}</Text>
+                                </Box>
+                                {ev?.reasoning ? (
+                                  <Box marginLeft={2}>
+                                    <Text wrap="wrap">{ev.reasoning}</Text>
+                                  </Box>
+                                ) : null}
+                              </Box>
+                            );
+                          })}
+                        </Box>
+                      )}
+
                     {/* Reasoning */}
                     <Box flexDirection="column">
                       <Text bold dimColor>
-                        Reasoning:
+                        Summary:
                       </Text>
                       <Box marginLeft={1}>
-                        <Text wrap="wrap" color={r.passed ? "green" : "red"}>
-                          {r.reasoning || "-"}
-                        </Text>
+                        <Text wrap="wrap">{r.reasoning || "-"}</Text>
                       </Box>
                     </Box>
                   </Box>
@@ -1486,10 +1708,33 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
         );
       }
 
-      // Sort by pass rate for charts
-      const sortedMetrics = [...metrics].sort(
-        (a, b) => b.pass_rate - a.pass_rate
-      );
+      // Union of evaluator names across models, preserving first-seen order
+      // so the table columns and chart sections line up regardless of which
+      // model loaded first.
+      const seenEval = new Set<string>();
+      const evaluatorNames: string[] = [];
+      for (const m of metrics) {
+        for (const name of Object.keys(m.evaluators ?? {})) {
+          if (!seenEval.has(name)) {
+            seenEval.add(name);
+            evaluatorNames.push(name);
+          }
+        }
+      }
+
+      // Resolve a single evaluator's type/scale info from the first model
+      // that reports it. Used to label per-evaluator charts (e.g. add
+      // "rating 1-5" to a rating evaluator's title).
+      const evaluatorMeta: Record<
+        string,
+        { type: "binary" | "rating" }
+      > = {};
+      for (const name of evaluatorNames) {
+        const found = metrics.find((m) => m.evaluators?.[name])?.evaluators?.[
+          name
+        ];
+        if (found) evaluatorMeta[name] = { type: found.type };
+      }
 
       return (
         <Box flexDirection="column" padding={1}>
@@ -1499,59 +1744,74 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
             </Text>
           </Box>
 
-          {/* Comparison Table */}
-          <Table
-            columns={[
-              { key: "model", label: "Model", width: 28 },
-              { key: "passed", label: "Passed", width: 8, align: "right" },
-              { key: "failed", label: "Failed", width: 8, align: "right" },
-              { key: "total", label: "Total", width: 8, align: "right" },
-              {
-                key: "pass_rate",
-                label: "Pass Rate",
-                width: 10,
-                align: "right",
-              },
-            ]}
-            data={metrics.map((m) => ({
-              model: m.model,
-              passed: String(m.passed),
-              failed: String(m.failed),
-              total: String(m.total),
-              pass_rate: m.pass_rate.toFixed(1) + "%",
-            }))}
-          />
-
-          {/* Pass Rate Chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>Pass Rate</Text>
-            <BarChart
-              data={sortedMetrics.map((m) => ({
-                label: m.model.length > 25 ? m.model.slice(-25) : m.model,
-                value: m.pass_rate,
-                color: "green",
-              }))}
-              maxWidth={40}
-            />
-          </Box>
-
-          {/* Overall Score Chart if available */}
-          {metrics.some((m) => m.overall !== undefined) && (
-            <Box marginTop={1} flexDirection="column">
-              <Text bold>Overall Score</Text>
-              <BarChart
-                data={[...metrics]
-                  .filter((m) => m.overall !== undefined)
-                  .sort((a, b) => (b.overall || 0) - (a.overall || 0))
-                  .map((m) => ({
-                    label: m.model.length > 25 ? m.model.slice(-25) : m.model,
-                    value: m.overall || 0,
-                    color: "cyan",
-                  }))}
-                maxWidth={40}
+          {/* Leaderboard table: overall test pass counts + per-evaluator
+              comparison columns. */}
+          {(() => {
+            // Tool-call aggregates are namespaced as ``tool:<name>``; widen
+            // the cap a little so the prefix doesn't eat the visible space.
+            const labelCap = 18;
+            const evaluatorColumns = evaluatorNames.map((name) => ({
+              key: name,
+              label: name.length > labelCap ? name.slice(0, labelCap) : name,
+              width: Math.max(10, Math.min(name.length, labelCap)),
+              align: "right" as const,
+            }));
+            return (
+              <Table
+                columns={[
+                  { key: "model", label: "Model", width: 28 },
+                  { key: "total", label: "Total", width: 7, align: "right" as const },
+                  { key: "passed", label: "Passed", width: 8, align: "right" as const },
+                  { key: "pass_rate", label: "Pass %", width: 9, align: "right" as const },
+                  ...evaluatorColumns,
+                ]}
+                data={metrics.map((m) => {
+                  const row: Record<string, string> = { model: m.model };
+                  row.total = m.total != null ? String(m.total) : "-";
+                  row.passed = m.passed != null ? String(m.passed) : "-";
+                  row.pass_rate =
+                    m.total != null && m.passed != null && m.total > 0
+                      ? `${((m.passed / m.total) * 100).toFixed(1)}%`
+                      : "-";
+                  for (const name of evaluatorNames) {
+                    row[name] = m.evaluators?.[name]?.display ?? "-";
+                  }
+                  return row;
+                })}
               />
-            </Box>
-          )}
+            );
+          })()}
+
+          {/* One chart per evaluator: bars compare every model on that
+              evaluator alone (binary → pass-rate %, rating → mean score).
+              No overall/generic pass-rate chart. */}
+          {evaluatorNames.map((name) => {
+            const meta = evaluatorMeta[name];
+            const data = [...metrics]
+              .filter((m) => m.evaluators?.[name])
+              .sort(
+                (a, b) =>
+                  (b.evaluators![name]!.sortValue) -
+                  (a.evaluators![name]!.sortValue)
+              )
+              .map((m) => ({
+                label: m.model.length > 25 ? m.model.slice(-25) : m.model,
+                value: m.evaluators![name]!.sortValue,
+                color: meta?.type === "rating" ? "cyan" : "green",
+              }));
+            if (data.length === 0) return null;
+            const subtitle =
+              meta?.type === "rating" ? "(mean rating)" : "(% passed)";
+            return (
+              <Box marginTop={1} flexDirection="column" key={name}>
+                <Box>
+                  <Text bold>{name} </Text>
+                  <Text dimColor>{subtitle}</Text>
+                </Box>
+                <BarChart data={data} maxWidth={40} />
+              </Box>
+            );
+          })}
 
           {/* Model selection to view details */}
           <Box marginTop={1} flexDirection="column">
@@ -1562,10 +1822,25 @@ export function LlmTestsApp({ onBack }: { onBack?: () => void }) {
             <Box marginTop={1}>
               <SelectInput
                 items={[
-                  ...leaderboardKeys.map((m) => ({
-                    label: (config.agentUrl && !config.agentBenchmark) ? "View test-by-test results" : `${m} — View test-by-test results`,
-                    value: m,
-                  })),
+                  ...leaderboardKeys.map((m) => {
+                    const isAgent =
+                      config.agentUrl && !config.agentBenchmark;
+                    const failed = isModelFailed(m);
+                    if (failed) {
+                      return {
+                        label: isAgent
+                          ? "Failed (view error)"
+                          : `${m} — Failed (view error)`,
+                        value: m,
+                      };
+                    }
+                    return {
+                      label: isAgent
+                        ? "View test-by-test results"
+                        : `${m} — View test-by-test results`,
+                      value: m,
+                    };
+                  }),
                   { label: "Exit", value: "__exit__" },
                 ]}
                 onSelect={(v) => {

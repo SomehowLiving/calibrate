@@ -46,14 +46,16 @@
       "description": "Start by asking about your order without providing the order ID. Only provide it after being asked."
     }
   ],
-  "evaluation_criteria": [
+  "evaluators": [
     {
       "name": "tool_usage",
-      "description": "The agent should call the log_inquiry tool with the correct inquiry_type and order_id when provided by the customer."
+      "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a helpful customer support assistant for an online store) and a simulated user.\n\nYou will be given the chat history of the conversation. Mark True if the agent called the `log_inquiry` tool with the correct `inquiry_type` and `order_id` whenever the customer provided one.",
+      "judge_model": "openai/gpt-5.2"
     },
     {
       "name": "response_quality",
-      "description": "The agent should be helpful, polite, and guide the customer through the process."
+      "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a helpful customer support assistant for an online store) and a simulated user.\n\nYou will be given the chat history of the conversation. Mark True if the agent was helpful, polite, and guided the customer through the process.",
+      "judge_model": "openai/gpt-5.2"
     }
   ],
   "settings": {
@@ -68,8 +70,5 @@
   },
   "llm": {
     "model": "google/gemini-3-flash-preview"
-  },
-  "judge": {
-    "model": "openai/gpt-5.2"
   }
 }

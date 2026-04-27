@@ -1,14 +1,14 @@
 """
 LLM evaluation metrics.
 
-Thin wrappers around calibrate.judges for backward compatibility.
+Thin wrappers around calibrate.judges that take pre-rendered evaluators.
 """
+
+from typing import List, Optional
 
 from calibrate.judges import (
     text_judge,
     simulation_judge,
-    normalize_criteria,
-    LLM_TEST_JUDGE_SYSTEM_PROMPT,
     DEFAULT_TEXT_JUDGE_MODEL,
     DEFAULT_SIMULATION_JUDGE_MODEL,
 )
@@ -24,26 +24,25 @@ DEFAULT_SIMULATION_JUDGE_MODEL = DEFAULT_SIMULATION_JUDGE_MODEL
     capture_input=False,
 )
 async def test_response_llm_judge(
-    conversation: list[dict],
+    conversation: List[dict],
     response: str,
-    criteria,
-    model: str = DEFAULT_JUDGE_MODEL,
+    evaluators: List[dict],
+    fallback_model: str = DEFAULT_JUDGE_MODEL,
 ) -> dict:
-    """Evaluate an LLM response against one or more criteria.
+    """Evaluate an LLM response against a list of pre-rendered evaluators.
 
     Args:
         conversation: Chat history (list of role/content dicts).
         response: The LLM's response text to evaluate.
-        criteria: Either a string (single criterion, backward compat) or a list of
-            {"name": str, "description": str} dicts for multi-criteria evaluation.
-        model: Judge model to use.
+        evaluators: List of evaluator dicts with their ``system_prompt``
+            already rendered (placeholders substituted) by the caller.
+        fallback_model: Model id for evaluators that don't set ``judge_model``.
 
     Returns:
-        When criteria is a string: {"reasoning": str, "match": bool}
-        When criteria is a list: {criterion_name: {"reasoning": str, "match": bool}, ...}
+        Dict keyed by evaluator name. Binary entries are
+        ``{"reasoning": str, "match": bool}``; rating entries are
+        ``{"reasoning": str, "score": int}``.
     """
-    criteria_list = normalize_criteria(criteria)
-
     conversation_as_prompt = "\n".join(
         [f'{msg["role"]}: {msg["content"]}' for msg in conversation if "content" in msg]
     )
@@ -53,37 +52,31 @@ async def test_response_llm_judge(
         f"`Response to evaluate`:\n\n{response}"
     )
 
-    result = await text_judge(
-        criteria=criteria_list,
+    return await text_judge(
+        evaluators=evaluators,
         user_prompt=user_prompt,
-        model=model,
-        system_prompt=LLM_TEST_JUDGE_SYSTEM_PROMPT,
+        fallback_model=fallback_model,
     )
-
-    # Backward compat: if original criteria was a string, return flat {reasoning, match}
-    if isinstance(criteria, str):
-        return result[criteria_list[0]["name"]]
-
-    return result
 
 
 async def evaluate_simuation(
-    conversation: list[dict],
-    evaluation_criteria: list[dict],
-    agent_system_prompt: str = "",
-    model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+    conversation: List[dict],
+    evaluators: List[dict],
+    fallback_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
     **kwargs,
 ) -> dict:
-    """Evaluate a simulation transcript against multiple criteria.
+    """Evaluate a simulation transcript against a list of pre-rendered evaluators.
 
-    Delegates to calibrate.judges.simulation_judge.
+    Simulation has no implicit default evaluator. If ``evaluators`` is empty,
+    no judge calls are made and ``{}`` is returned.
 
-    Returns:
-        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
+    Args:
+        conversation: Full conversation transcript (list of role/content dicts).
+        evaluators: List of evaluator dicts (already rendered).
+        fallback_model: Model id for evaluators that don't set ``judge_model``.
     """
     return await simulation_judge(
         conversation=conversation,
-        evaluation_criteria=evaluation_criteria,
-        agent_system_prompt=agent_system_prompt,
-        model=model,
+        evaluators=evaluators,
+        fallback_model=fallback_model,
     )

@@ -179,14 +179,26 @@ class TestRunTestExternalToolCall(unittest.IsolatedAsyncioTestCase):
 
 class TestRunTestExternalResponse(unittest.IsolatedAsyncioTestCase):
 
-    async def _run(self, agent_response, criteria, judge_result):
+    @staticmethod
+    def _default_evaluator(name: str = "default") -> dict:
+        return {
+            "name": name,
+            "system_prompt": "Evaluate the response.",
+            "judge_model": "openai/gpt-4.1",
+        }
+
+    async def _run(self, agent_response, judge_result, evaluators=None):
         from calibrate.connections import TextAgentConnection
         from calibrate.llm.run_tests import run_test_external
 
         agent = TextAgentConnection(url="http://fake-agent/chat")
         fake_body = {"response": agent_response, "tool_calls": []}
 
-        evaluation = {"type": "response", "criteria": criteria}
+        evaluators = evaluators or [self._default_evaluator()]
+        evaluation = {
+            "type": "response",
+            "criteria": [{"name": ev["name"]} for ev in evaluators],
+        }
 
         mock_judge = AsyncMock(return_value=judge_result)
 
@@ -198,13 +210,18 @@ class TestRunTestExternalResponse(unittest.IsolatedAsyncioTestCase):
                 chat_history=[{"role": "user", "content": "Who are you?"}],
                 evaluation=evaluation,
                 agent=agent,
+                evaluators=evaluators,
             )
 
     async def test_response_pass_when_judge_says_match(self):
         result = await self._run(
             agent_response="I am a helpful assistant.",
-            criteria="Agent should introduce itself",
-            judge_result={"match": True, "reasoning": "Agent introduced itself clearly"},
+            judge_result={
+                "default": {
+                    "match": True,
+                    "reasoning": "Agent introduced itself clearly",
+                }
+            },
         )
         self.assertTrue(result["metrics"]["passed"])
         self.assertIn("reasoning", result["metrics"])
@@ -212,8 +229,12 @@ class TestRunTestExternalResponse(unittest.IsolatedAsyncioTestCase):
     async def test_response_fail_when_judge_says_no_match(self):
         result = await self._run(
             agent_response="The capital of France is Paris.",
-            criteria="Agent should introduce itself",
-            judge_result={"match": False, "reasoning": "Agent did not introduce itself"},
+            judge_result={
+                "default": {
+                    "match": False,
+                    "reasoning": "Agent did not introduce itself",
+                }
+            },
         )
         self.assertFalse(result["metrics"]["passed"])
 

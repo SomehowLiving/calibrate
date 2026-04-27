@@ -209,6 +209,7 @@ Examples:
     )
     stt_parser.add_argument("-s", "--save-dir", type=str)
     stt_parser.add_argument(
+        "-c",
         "--config",
         type=str,
         default=None,
@@ -243,6 +244,7 @@ Examples:
     )
     tts_parser.add_argument("-s", "--save-dir", type=str)
     tts_parser.add_argument(
+        "-c",
         "--config",
         type=str,
         default=None,
@@ -592,10 +594,14 @@ Examples:
             # Pre-verify agent connection if config has agent_url
             if args.config:
                 import json as _json
+
                 with open(args.config) as _f:
                     _sim_config = _json.load(_f)
-                if _sim_config.get("agent_url") and not getattr(args, "skip_verify", False):
+                if _sim_config.get("agent_url") and not getattr(
+                    args, "skip_verify", False
+                ):
                     from calibrate.connections import TextAgentConnection
+
                     _sim_agent = TextAgentConnection(
                         url=_sim_config["agent_url"],
                         headers=_sim_config.get("agent_headers"),

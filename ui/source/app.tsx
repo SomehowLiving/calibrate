@@ -43,6 +43,10 @@ interface EvalConfig {
   overwrite: boolean;
   envVars: Record<string, string>;
   calibrate: CalibrateCmd;
+  // Optional path to a JSON config file with an ``evaluators`` list. When
+  // unset, the backend falls back to its default evaluator (semantic_match
+  // for STT, pronunciation for TTS).
+  configFile?: string;
 }
 
 type Step =
@@ -50,6 +54,7 @@ type Step =
   | "select-providers"
   | "config-input"
   | "config-output"
+  | "config-file"
   | "setup-keys"
   | "running";
 
@@ -67,6 +72,124 @@ function getModeLabel(mode: EvalMode): string {
 
 function getAllProviders(mode: EvalMode) {
   return mode === "tts" ? TTS_PROVIDERS : STT_PROVIDERS;
+}
+
+// Reserved metrics.json keys that are NOT evaluator-derived. Anything else
+// ending in ``_score`` is treated as ``<evaluator>_score``.
+const RESERVED_METRIC_KEYS = new Set(["wer", "ttfb", "count", "provider"]);
+
+function evaluatorNamesFromMetrics(
+  data: Record<string, unknown>
+): string[] {
+  return Object.keys(data)
+    .filter((k) => k.endsWith("_score"))
+    .map((k) => k.slice(0, -"_score".length))
+    .filter((n) => !RESERVED_METRIC_KEYS.has(n));
+}
+
+function evaluatorScoresFromMetrics(
+  data: Record<string, unknown>
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const name of evaluatorNamesFromMetrics(data)) {
+    const v = data[`${name}_score`];
+    out[name] = typeof v === "number" ? v : Number(v) || 0;
+  }
+  return out;
+}
+
+type EvaluatorInfo = {
+  type: "binary" | "rating";
+  scale_min?: number;
+  scale_max?: number;
+};
+
+// Extract per-evaluator metadata (type + rating scale) from metrics.json
+// `<name>_info` entries written by the backend.
+function evaluatorMetaFromMetrics(
+  data: Record<string, unknown>
+): Record<string, EvaluatorInfo> {
+  const out: Record<string, EvaluatorInfo> = {};
+  for (const key of Object.keys(data)) {
+    if (!key.endsWith("_info")) continue;
+    const name = key.slice(0, -"_info".length);
+    if (RESERVED_METRIC_KEYS.has(name)) continue;
+    const info = data[key];
+    if (!info || typeof info !== "object") continue;
+    const i = info as Record<string, unknown>;
+    const type = i["type"] === "rating" ? "rating" : "binary";
+    const meta: EvaluatorInfo = { type };
+    if (type === "rating") {
+      if (typeof i["scale_min"] === "number")
+        meta.scale_min = i["scale_min"] as number;
+      if (typeof i["scale_max"] === "number")
+        meta.scale_max = i["scale_max"] as number;
+    }
+    out[name] = meta;
+  }
+  return out;
+}
+
+// Resolve the color for an evaluator score in row-by-row output.
+// - binary: green for pass (true/1/"True"), red for fail (false/0/"False")
+// - rating: red for scale_min, green for scale_max, yellow in between
+function evaluatorScoreColor(
+  score: unknown,
+  meta: EvaluatorInfo | undefined
+): string | undefined {
+  if (
+    meta?.type === "rating" &&
+    typeof score === "number" &&
+    typeof meta.scale_min === "number" &&
+    typeof meta.scale_max === "number"
+  ) {
+    if (score <= meta.scale_min) return "red";
+    if (score >= meta.scale_max) return "green";
+    return "yellow";
+  }
+  const passed = score === true || score === "True" || score === 1;
+  const failed = score === false || score === "False" || score === 0;
+  return passed ? "green" : failed ? "red" : undefined;
+}
+
+function evaluatorNamesFromCsvHeaders(headers: string[]): string[] {
+  return headers
+    .filter((h) => h.endsWith("_score"))
+    .map((h) => h.slice(0, -"_score".length))
+    .filter((n) => !RESERVED_METRIC_KEYS.has(n));
+}
+
+function unionEvaluatorNames(
+  metrics: Array<Record<string, string | number>>
+): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const m of metrics) {
+    for (const k of Object.keys(m)) {
+      if (RESERVED_METRIC_KEYS.has(k) || k === "provider" || k === "count") {
+        continue;
+      }
+      if (typeof m[k] === "number" && !seen.has(k)) {
+        seen.add(k);
+        ordered.push(k);
+      }
+    }
+  }
+  return ordered;
+}
+
+// Format a per-evaluator score cell. Binary scores arrive as boolean-looking
+// values (True/False/1/0); rating scores arrive as numbers and are rendered
+// as integers (per-row rating scores are always integral by design).
+function formatEvaluatorCell(val: unknown, meta?: EvaluatorInfo): string {
+  if (meta?.type === "rating" && typeof val === "number") {
+    return String(Math.round(val));
+  }
+  if (val === true || val === "True" || val === 1) return "Pass";
+  if (val === false || val === "False" || val === 0) return "Fail";
+  if (typeof val === "number") return val.toFixed(2);
+  if (val === undefined || val === null || val === "") return "-";
+  return String(val);
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -483,7 +606,100 @@ function ConfigOutputStep({
 }
 
 // ═════════════════════════════════════════════════════════════
-// Step 5: API Key Setup
+// Step 5: Optional config file (evaluators, judge model, prompts)
+// ═════════════════════════════════════════════════════════════
+function ConfigFileStep({
+  mode,
+  onComplete,
+  onBack,
+}: {
+  mode: EvalMode;
+  onComplete: (configPath: string | undefined) => void;
+  onBack: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState("");
+
+  useInput((_input, key) => {
+    if (key.escape) {
+      onBack();
+    }
+  });
+
+  const handleSubmit = (val: string) => {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      // Empty = skip; backend will use the default evaluator.
+      onComplete(undefined);
+      return;
+    }
+    if (!fs.existsSync(trimmed)) {
+      setError(`File not found: ${trimmed}`);
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(trimmed, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object") {
+        setError("Config file must contain a JSON object");
+        return;
+      }
+    } catch (e) {
+      setError(`Invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    onComplete(trimmed);
+  };
+
+  const docsUrl =
+    mode === "tts"
+      ? "https://calibrate.artpark.ai/docs/cli/text-to-speech"
+      : "https://calibrate.artpark.ai/docs/cli/speech-to-text";
+
+  return (
+    <Box flexDirection="column" padding={1}>
+      <Box marginBottom={1}>
+        <Text bold color="cyan">
+          Evaluator config (optional)
+        </Text>
+      </Box>
+      <Box>
+        <Text>Config JSON: </Text>
+        <TextInput
+          value={value}
+          onChange={(v) => {
+            setValue(v);
+            setError("");
+          }}
+          onSubmit={handleSubmit}
+        />
+      </Box>
+      {error ? (
+        <Box marginTop={1}>
+          <Text color="red">{error}</Text>
+        </Box>
+      ) : (
+        <Box marginTop={1} flexDirection="column">
+          <Text dimColor>
+            Path to a JSON file with a top-level{" "}
+            <Text color="yellow">evaluators</Text> list. Leave empty to use the
+            default {mode === "tts" ? "pronunciation" : "semantic_match"}{" "}
+            evaluator.
+          </Text>
+          <Text dimColor>
+            See config format: <Text color="blue">{docsUrl}</Text>
+          </Text>
+        </Box>
+      )}
+      <Box marginTop={1}>
+        <Text dimColor>Press enter to skip, Esc to go back</Text>
+      </Box>
+    </Box>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════
+// Step 6: API Key Setup
 // ═════════════════════════════════════════════════════════════
 function KeySetupStep({
   mode,
@@ -506,10 +722,10 @@ function KeySetupStep({
     }> = [];
     const seen = new Set<string>();
 
-    // Always need OPENAI_API_KEY for LLM judge
+    // Always need OPENAI_API_KEY for evaluators
     result.push({
       envVar: "OPENAI_API_KEY",
-      label: "OpenAI (LLM Judge)",
+      label: "OpenAI (Evaluators)",
       isFilePath: false,
       found: !!getCredential("OPENAI_API_KEY"),
     });
@@ -700,6 +916,9 @@ function RunStep({
     if (config.overwrite) {
       args.push("--overwrite");
     }
+    if (config.configFile) {
+      args.push("-c", config.configFile);
+    }
     // Generate leaderboard after the last provider eval
     if (isLastProvider) {
       args.push("--leaderboard");
@@ -778,16 +997,16 @@ function RunStep({
             "metrics.json"
           );
           const raw = JSON.parse(fs.readFileSync(metricsPath, "utf-8"));
+          const evaluatorScores = evaluatorScoresFromMetrics(raw);
           if (config.mode === "tts") {
             metrics = {
-              llm_judge_score: raw.llm_judge_score ?? 0,
+              ...evaluatorScores,
               ttfb: raw.ttfb?.mean ?? raw.ttfb ?? 0,
             };
           } else {
             metrics = {
               wer: raw.wer ?? 0,
-              string_similarity: raw.string_similarity ?? 0,
-              llm_judge_score: raw.llm_judge_score ?? 0,
+              ...evaluatorScores,
             };
           }
         } catch {
@@ -854,22 +1073,27 @@ function RunStep({
   // Inline metric summary
   function renderMetricSummary(state: ProviderState) {
     if (!state.metrics) return null;
+    const m = state.metrics;
+    const evalEntries = Object.entries(m).filter(
+      ([k]) => !RESERVED_METRIC_KEYS.has(k)
+    );
+    const parts: string[] = [];
     if (config.mode === "tts") {
-      return (
-        <Text dimColor>
-          llm_judge: {state.metrics.llm_judge_score?.toFixed(2)}
-          {"  "}ttfb: {state.metrics.ttfb?.toFixed(2)}s
-        </Text>
-      );
+      for (const [name, val] of evalEntries) {
+        parts.push(`${name}: ${val?.toFixed(2)}`);
+      }
+      if (typeof m.ttfb === "number") {
+        parts.push(`ttfb: ${m.ttfb.toFixed(2)}s`);
+      }
     } else {
-      return (
-        <Text dimColor>
-          wer: {state.metrics.wer?.toFixed(2)}
-          {"  "}similarity: {state.metrics.string_similarity?.toFixed(2)}
-          {"  "}llm_judge: {state.metrics.llm_judge_score?.toFixed(2)}
-        </Text>
-      );
+      if (typeof m.wer === "number") {
+        parts.push(`wer: ${m.wer.toFixed(2)}`);
+      }
+      for (const [name, val] of evalEntries) {
+        parts.push(`${name}: ${val?.toFixed(2)}`);
+      }
     }
+    return <Text dimColor>{parts.join("  ")}</Text>;
   }
 
   return (
@@ -988,6 +1212,10 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
       [key: string]: string | number;
     }>
   >([]);
+  const [evaluatorMeta, setEvaluatorMeta] = useState<
+    Record<string, EvaluatorInfo>
+  >({});
+  const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
 
   useEffect(() => {
     const results: typeof metrics = [];
@@ -1012,10 +1240,11 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
           // no results.csv
         }
 
+        const evaluatorScores = evaluatorScoresFromMetrics(data);
         if (config.mode === "tts") {
           results.push({
             provider,
-            llm_judge_score: data.llm_judge_score ?? 0,
+            ...evaluatorScores,
             ttfb: data.ttfb?.mean ?? data.ttfb ?? 0,
             count,
           });
@@ -1023,8 +1252,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
           results.push({
             provider,
             wer: data.wer ?? 0,
-            string_similarity: data.string_similarity ?? 0,
-            llm_judge_score: data.llm_judge_score ?? 0,
+            ...evaluatorScores,
             count,
           });
         }
@@ -1084,10 +1312,12 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
         const row: ProviderResult = { id: "" };
         headers.forEach((h, idx) => {
           const val = values[idx] || "";
-          // Try to parse as number for numeric fields
-          if (
-            ["wer", "string_similarity", "llm_judge_score", "ttfb"].includes(h)
-          ) {
+          // Numeric columns: wer, ttfb, and any per-evaluator `<name>_score`.
+          // Boolean-looking score values (True/False) stay as strings so the
+          // row table can render Pass/Fail badges.
+          const isNumericMetric =
+            h === "wer" || h === "ttfb" || h.endsWith("_score");
+          if (isNumericMetric) {
             const num = parseFloat(val);
             row[h] = isNaN(num) ? val : num;
           } else {
@@ -1099,8 +1329,21 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
       setProviderResults(rows);
       setScrollOffset(0);
       setSelectedRowIdx(0);
+      setExpandedRows(new Set());
     } catch {
       setProviderResults([]);
+    }
+
+    try {
+      const metricsPath = path.join(
+        config.outputDir,
+        selectedProvider,
+        "metrics.json"
+      );
+      const data = JSON.parse(fs.readFileSync(metricsPath, "utf-8"));
+      setEvaluatorMeta(evaluatorMetaFromMetrics(data));
+    } catch {
+      setEvaluatorMeta({});
     }
   }, [selectedProvider, config.outputDir]);
 
@@ -1221,16 +1464,36 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
         stopAudio();
       }
     }
-    // Scroll in STT provider detail view (non-TTS keeps old behavior)
+    // Navigation and expand/collapse in STT provider detail view
     if (view === "provider-detail" && config.mode !== "tts") {
-      if (key.upArrow && scrollOffset > 0) {
-        setScrollOffset((o) => o - 1);
+      if (key.upArrow) {
+        setSelectedRowIdx((idx) => {
+          const newIdx = Math.max(0, idx - 1);
+          if (newIdx < scrollOffset) {
+            setScrollOffset(newIdx);
+          }
+          return newIdx;
+        });
       }
-      if (
-        key.downArrow &&
-        scrollOffset < providerResults.length - MAX_VISIBLE_ROWS
-      ) {
-        setScrollOffset((o) => o + 1);
+      if (key.downArrow) {
+        setSelectedRowIdx((idx) => {
+          const newIdx = Math.min(providerResults.length - 1, idx + 1);
+          if (newIdx >= scrollOffset + MAX_VISIBLE_ROWS) {
+            setScrollOffset(newIdx - MAX_VISIBLE_ROWS + 1);
+          }
+          return newIdx;
+        });
+      }
+      if (key.return || input === " ") {
+        setExpandedRows((prev) => {
+          const next = new Set(prev);
+          if (next.has(selectedRowIdx)) {
+            next.delete(selectedRowIdx);
+          } else {
+            next.add(selectedRowIdx);
+          }
+          return next;
+        });
       }
     }
   });
@@ -1259,6 +1522,11 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
     );
     const truncate = (s: string, max: number) =>
       s.length > max ? s.slice(0, max - 1) + "…" : s;
+    // Discover per-evaluator columns from results.csv headers (`<name>_score`).
+    const detailEvaluatorNames =
+      providerResults.length > 0
+        ? evaluatorNamesFromCsvHeaders(Object.keys(providerResults[0]!))
+        : [];
 
     return (
       <Box flexDirection="column" padding={1}>
@@ -1282,7 +1550,11 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   <Text bold> | {"ID".padEnd(10)}</Text>
                   <Text bold> | {"Text".padEnd(28)}</Text>
                   <Text bold> | {"TTFB".padStart(8)}</Text>
-                  <Text bold> | {"LLM Judge".padStart(10)}</Text>
+                  {detailEvaluatorNames.map((name) => (
+                    <Text key={name} bold>
+                      {" | " + truncate(name, 10).padStart(10)}
+                    </Text>
+                  ))}
                 </Box>
                 {/* Separator */}
                 <Text dimColor>
@@ -1294,8 +1566,9 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                     "-".repeat(28) +
                     "-+-" +
                     "-".repeat(8) +
-                    "-+-" +
-                    "-".repeat(10)}
+                    detailEvaluatorNames
+                      .map(() => "-+-" + "-".repeat(10))
+                      .join("")}
                 </Text>
                 {/* Rows */}
                 {visibleRows.map((r, idx) => {
@@ -1303,16 +1576,6 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   const isSelected = absoluteIdx === selectedRowIdx;
                   const rowId = String(r.id || "");
                   const isPlaying = playingAudio === rowId;
-                  const llmJudge =
-                    r.llm_judge_score === true ||
-                    r.llm_judge_score === "True" ||
-                    r.llm_judge_score === 1
-                      ? "Pass"
-                      : r.llm_judge_score === false ||
-                        r.llm_judge_score === "False" ||
-                        r.llm_judge_score === 0
-                      ? "Fail"
-                      : String(r.llm_judge_score || "-");
 
                   return (
                     <Box key={idx}>
@@ -1342,9 +1605,18 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                             : "-"
                           ).padStart(8)}
                       </Text>
-                      <Text color={isSelected ? "cyan" : undefined}>
-                        {" | " + llmJudge.padStart(10)}
-                      </Text>
+                      {detailEvaluatorNames.map((name) => (
+                        <Text
+                          key={name}
+                          color={isSelected ? "cyan" : undefined}
+                        >
+                          {" | " +
+                            formatEvaluatorCell(
+                              r[`${name}_score`],
+                              evaluatorMeta[name]
+                            ).padStart(10)}
+                        </Text>
+                      ))}
                     </Box>
                   );
                 })}
@@ -1356,39 +1628,28 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   { key: "gt", label: "Ground Truth", width: 25 },
                   { key: "pred", label: "Prediction", width: 25 },
                   { key: "wer", label: "WER", width: 6, align: "right" },
-                  {
-                    key: "similarity",
-                    label: "Sim",
-                    width: 6,
-                    align: "right",
-                  },
-                  {
-                    key: "llm_judge",
-                    label: "Judge",
-                    width: 6,
-                    align: "right",
-                  },
+                  ...detailEvaluatorNames.map((name) => ({
+                    key: name,
+                    label: name.length > 10 ? name.slice(0, 10) : name,
+                    width: Math.max(6, Math.min(name.length, 10)),
+                    align: "right" as const,
+                  })),
                 ]}
-                data={visibleRows.map((r) => ({
-                  id: truncate(String(r.id || ""), 10),
-                  gt: truncate(String(r.gt || ""), 25),
-                  pred: truncate(String(r.pred || ""), 25),
-                  wer: typeof r.wer === "number" ? r.wer.toFixed(2) : "-",
-                  similarity:
-                    typeof r.string_similarity === "number"
-                      ? r.string_similarity.toFixed(2)
-                      : "-",
-                  llm_judge:
-                    r.llm_judge_score === true ||
-                    r.llm_judge_score === "True" ||
-                    r.llm_judge_score === 1
-                      ? "Pass"
-                      : r.llm_judge_score === false ||
-                        r.llm_judge_score === "False" ||
-                        r.llm_judge_score === 0
-                      ? "Fail"
-                      : String(r.llm_judge_score || "-"),
-                }))}
+                data={visibleRows.map((r) => {
+                  const row: Record<string, string> = {
+                    id: truncate(String(r.id || ""), 10),
+                    gt: truncate(String(r.gt || ""), 25),
+                    pred: truncate(String(r.pred || ""), 25),
+                    wer: typeof r.wer === "number" ? r.wer.toFixed(2) : "-",
+                  };
+                  for (const name of detailEvaluatorNames) {
+                    row[name] = formatEvaluatorCell(
+                      r[`${name}_score`],
+                      evaluatorMeta[name]
+                    );
+                  }
+                  return row;
+                })}
               />
             )}
 
@@ -1404,7 +1665,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   of {providerResults.length}
                   {config.mode === "tts"
                     ? " | ↑↓ navigate, Enter/p play, s stop"
-                    : " | Use ↑↓ to scroll"}
+                    : " | ↑↓ navigate, Enter to expand/collapse"}
                 </Text>
               </Box>
             )}
@@ -1423,35 +1684,148 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                 </Box>
               )}
 
-            {/* LLM Judge Reasoning for visible rows */}
-            <Box marginTop={1} flexDirection="column">
-              <Text bold dimColor>
-                LLM Judge Reasoning:
-              </Text>
-              {visibleRows.map((r, idx) => {
-                const reasoning = String(r.llm_judge_reasoning || "");
-                if (!reasoning || reasoning === "-") return null;
-                const passed =
-                  r.llm_judge_score === true ||
-                  r.llm_judge_score === "True" ||
-                  r.llm_judge_score === 1;
-                return (
-                  <Box key={idx} marginTop={1} flexDirection="column">
-                    <Box>
-                      <Text color={passed ? "green" : "red"}>
-                        [{String(r.id || idx + 1)}]{" "}
-                      </Text>
-                      <Text color={passed ? "green" : "red"}>
-                        {passed ? "Pass" : "Fail"}
-                      </Text>
+            {/* Per-evaluator reasoning for visible rows (TTS) */}
+            {config.mode === "tts" && detailEvaluatorNames.length > 0 && (
+              <Box marginTop={1} flexDirection="column">
+                <Text bold dimColor>
+                  Evaluator Reasoning:
+                </Text>
+                {visibleRows.map((r, idx) => {
+                  type ReasoningBlock = {
+                    name: string;
+                    reasoning: string;
+                    color: string | undefined;
+                    score: string | number | boolean;
+                  };
+                  const blocks: ReasoningBlock[] = [];
+                  for (const name of detailEvaluatorNames) {
+                    const reasoning = String(r[`${name}_reasoning`] || "");
+                    if (!reasoning || reasoning === "-") continue;
+                    const score = r[`${name}_score`] ?? "-";
+                    const color = evaluatorScoreColor(
+                      score,
+                      evaluatorMeta[name]
+                    );
+                    blocks.push({ name, reasoning, color, score });
+                  }
+                  if (blocks.length === 0) return null;
+                  return (
+                    <Box key={idx} marginTop={1} flexDirection="column">
+                      <Text dimColor>[{String(r.id || idx + 1)}]</Text>
+                      {blocks.map((b) => (
+                        <Box key={b.name} marginLeft={2} flexDirection="column">
+                          <Box>
+                            <Text color={b.color}>
+                              {b.name}:{" "}
+                              {formatEvaluatorCell(
+                                b.score,
+                                evaluatorMeta[b.name]
+                              )}
+                            </Text>
+                          </Box>
+                          <Box marginLeft={2}>
+                            <Text wrap="wrap">{b.reasoning}</Text>
+                          </Box>
+                        </Box>
+                      ))}
                     </Box>
-                    <Box marginLeft={2}>
-                      <Text wrap="wrap">{reasoning}</Text>
+                  );
+                })}
+              </Box>
+            )}
+
+            {/* Per-row details for STT — full GT/Pred always shown,
+                evaluator reasoning toggled with Enter on the selected row. */}
+            {config.mode !== "tts" && (
+              <Box marginTop={1} flexDirection="column">
+                <Text bold dimColor>
+                  Row Details:
+                </Text>
+                {visibleRows.map((r, idx) => {
+                  const absoluteIdx = scrollOffset + idx;
+                  const isSelected = absoluteIdx === selectedRowIdx;
+                  const isExpanded = expandedRows.has(absoluteIdx);
+
+                  type ReasoningBlock = {
+                    name: string;
+                    reasoning: string;
+                    color: string | undefined;
+                    score: string | number | boolean;
+                  };
+                  const blocks: ReasoningBlock[] = [];
+                  for (const name of detailEvaluatorNames) {
+                    const reasoning = String(r[`${name}_reasoning`] || "");
+                    if (!reasoning || reasoning === "-") continue;
+                    const score = r[`${name}_score`] ?? "-";
+                    const color = evaluatorScoreColor(
+                      score,
+                      evaluatorMeta[name]
+                    );
+                    blocks.push({ name, reasoning, color, score });
+                  }
+                  const hasBlocks = blocks.length > 0;
+
+                  return (
+                    <Box
+                      key={absoluteIdx}
+                      marginTop={1}
+                      flexDirection="column"
+                    >
+                      <Box>
+                        <Text
+                          color={isSelected ? "cyan" : undefined}
+                          bold={isSelected}
+                        >
+                          {(isSelected ? "> " : "  ") +
+                            `[${String(r.id || idx + 1)}]`}
+                        </Text>
+                        {hasBlocks && (
+                          <Text dimColor> {isExpanded ? "▼" : "▶"}</Text>
+                        )}
+                      </Box>
+                      <Box marginLeft={4} flexDirection="column">
+                        <Box>
+                          <Text bold dimColor>
+                            GT:{" "}
+                          </Text>
+                          <Text wrap="wrap">{String(r.gt || "")}</Text>
+                        </Box>
+                        <Box>
+                          <Text bold dimColor>
+                            Pred:{" "}
+                          </Text>
+                          <Text wrap="wrap">{String(r.pred || "")}</Text>
+                        </Box>
+                        {isExpanded && hasBlocks && (
+                          <Box marginTop={1} flexDirection="column">
+                            {blocks.map((b) => (
+                              <Box
+                                key={b.name}
+                                flexDirection="column"
+                                marginTop={1}
+                              >
+                                <Box>
+                                  <Text color={b.color}>
+                                    {b.name}:{" "}
+                                    {formatEvaluatorCell(
+                                      b.score,
+                                      evaluatorMeta[b.name]
+                                    )}
+                                  </Text>
+                                </Box>
+                                <Box marginLeft={2}>
+                                  <Text wrap="wrap">{b.reasoning}</Text>
+                                </Box>
+                              </Box>
+                            ))}
+                          </Box>
+                        )}
+                      </Box>
                     </Box>
-                  </Box>
-                );
-              })}
-            </Box>
+                  );
+                })}
+              </Box>
+            )}
           </>
         )}
 
@@ -1459,7 +1833,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
           <Text dimColor>
             {config.mode === "tts"
               ? "q/Esc back | ↑↓ navigate | Enter/p play | s stop"
-              : "Press q or Esc to go back to leaderboard"}
+              : "q/Esc back | ↑↓ navigate | Enter to expand/collapse"}
           </Text>
         </Box>
       </Box>
@@ -1476,121 +1850,115 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
       </Box>
 
       {/* Comparison Table */}
-      {config.mode === "tts" ? (
-        <Table
-          columns={[
-            { key: "provider", label: "Provider", width: 14 },
-            { key: "llm_judge", label: "LLM Judge", width: 10, align: "right" },
-            { key: "ttfb", label: "TTFB (avg)", width: 11, align: "right" },
-            { key: "count", label: "Count", width: 6, align: "right" },
-          ]}
-          data={metrics.map((m) => ({
-            provider: m.provider as string,
-            llm_judge: (m.llm_judge_score as number).toFixed(2),
-            ttfb: (m.ttfb as number).toFixed(2) + "s",
-            count: String(m.count),
-          }))}
-        />
-      ) : (
-        <Table
-          columns={[
-            { key: "provider", label: "Provider", width: 14 },
-            { key: "wer", label: "WER", width: 8, align: "right" },
-            {
-              key: "similarity",
-              label: "Similarity",
-              width: 11,
-              align: "right",
-            },
-            { key: "llm_judge", label: "LLM Judge", width: 10, align: "right" },
-            { key: "count", label: "Count", width: 6, align: "right" },
-          ]}
-          data={metrics.map((m) => ({
-            provider: m.provider as string,
-            wer: (m.wer as number).toFixed(2),
-            similarity: (m.string_similarity as number).toFixed(2),
-            llm_judge: (m.llm_judge_score as number).toFixed(2),
-            count: String(m.count),
-          }))}
-        />
-      )}
+      {(() => {
+        const lbEvaluatorNames = unionEvaluatorNames(metrics);
+        const evaluatorColumns = lbEvaluatorNames.map((name) => ({
+          key: name,
+          label: name.length > 12 ? name.slice(0, 12) : name,
+          width: Math.max(8, Math.min(name.length, 12)),
+          align: "right" as const,
+        }));
+        const evaluatorCells = (m: (typeof metrics)[number]) => {
+          const out: Record<string, string> = {};
+          for (const name of lbEvaluatorNames) {
+            const v = m[name];
+            out[name] = typeof v === "number" ? v.toFixed(2) : "-";
+          }
+          return out;
+        };
+        return config.mode === "tts" ? (
+          <Table
+            columns={[
+              { key: "provider", label: "Provider", width: 14 },
+              ...evaluatorColumns,
+              { key: "ttfb", label: "TTFB (avg)", width: 11, align: "right" },
+              { key: "count", label: "Count", width: 6, align: "right" },
+            ]}
+            data={metrics.map((m) => ({
+              provider: m.provider as string,
+              ...evaluatorCells(m),
+              ttfb:
+                typeof m.ttfb === "number" ? m.ttfb.toFixed(2) + "s" : "-",
+              count: String(m.count),
+            }))}
+          />
+        ) : (
+          <Table
+            columns={[
+              { key: "provider", label: "Provider", width: 14 },
+              { key: "wer", label: "WER", width: 8, align: "right" },
+              ...evaluatorColumns,
+              { key: "count", label: "Count", width: 6, align: "right" },
+            ]}
+            data={metrics.map((m) => ({
+              provider: m.provider as string,
+              wer: typeof m.wer === "number" ? m.wer.toFixed(2) : "-",
+              ...evaluatorCells(m),
+              count: String(m.count),
+            }))}
+          />
+        );
+      })()}
 
       {/* Charts */}
-      {config.mode === "tts" ? (
-        <>
-          {/* LLM Judge Score bar chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>LLM Judge Score</Text>
+      {(() => {
+        const chartEvaluatorNames = unionEvaluatorNames(metrics);
+        const evaluatorCharts = chartEvaluatorNames.map((name) => (
+          <Box key={name} marginTop={1} flexDirection="column">
+            <Text bold>{name}</Text>
             <BarChart
               data={metrics.map((m) => ({
                 label: m.provider as string,
-                value: m.llm_judge_score as number,
+                value: typeof m[name] === "number" ? (m[name] as number) : 0,
                 color: "green",
               }))}
             />
           </Box>
+        ));
+        return config.mode === "tts" ? (
+          <>
+            {evaluatorCharts}
 
-          {/* TTFB bar chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Box>
-              <Text bold>TTFB </Text>
-              <Text dimColor>(lower is better)</Text>
+            {/* TTFB bar chart */}
+            <Box marginTop={1} flexDirection="column">
+              <Box>
+                <Text bold>TTFB </Text>
+                <Text dimColor>(lower is better)</Text>
+              </Box>
+              <BarChart
+                data={[...metrics]
+                  .sort((a, b) => (a.ttfb as number) - (b.ttfb as number))
+                  .map((m) => ({
+                    label: m.provider as string,
+                    value: m.ttfb as number,
+                    color: "yellow",
+                  }))}
+              />
             </Box>
-            <BarChart
-              data={[...metrics]
-                .sort((a, b) => (a.ttfb as number) - (b.ttfb as number))
-                .map((m) => ({
-                  label: m.provider as string,
-                  value: m.ttfb as number,
-                  color: "yellow",
-                }))}
-            />
-          </Box>
-        </>
-      ) : (
-        <>
-          {/* WER bar chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Box>
-              <Text bold>Word Error Rate </Text>
-              <Text dimColor>(lower is better)</Text>
+          </>
+        ) : (
+          <>
+            {/* WER bar chart */}
+            <Box marginTop={1} flexDirection="column">
+              <Box>
+                <Text bold>Word Error Rate </Text>
+                <Text dimColor>(lower is better)</Text>
+              </Box>
+              <BarChart
+                data={[...metrics]
+                  .sort((a, b) => (a.wer as number) - (b.wer as number))
+                  .map((m) => ({
+                    label: m.provider as string,
+                    value: m.wer as number,
+                    color: "yellow",
+                  }))}
+              />
             </Box>
-            <BarChart
-              data={[...metrics]
-                .sort((a, b) => (a.wer as number) - (b.wer as number))
-                .map((m) => ({
-                  label: m.provider as string,
-                  value: m.wer as number,
-                  color: "yellow",
-                }))}
-            />
-          </Box>
 
-          {/* String Similarity bar chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>String Similarity</Text>
-            <BarChart
-              data={metrics.map((m) => ({
-                label: m.provider as string,
-                value: m.string_similarity as number,
-                color: "green",
-              }))}
-            />
-          </Box>
-
-          {/* LLM Judge Score bar chart */}
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>LLM Judge Score</Text>
-            <BarChart
-              data={metrics.map((m) => ({
-                label: m.provider as string,
-                value: m.llm_judge_score as number,
-                color: "green",
-              }))}
-            />
-          </Box>
-        </>
-      )}
+            {evaluatorCharts}
+          </>
+        );
+      })()}
 
       {/* Provider selection to view details */}
       <Box marginTop={1} flexDirection="column">
@@ -1794,9 +2162,21 @@ function EvalApp({
           providers={config.providers}
           onComplete={(dir, overwrite) => {
             setConfig((c) => ({ ...c, outputDir: dir, overwrite }));
-            setStep("setup-keys");
+            setStep("config-file");
           }}
           onBack={() => setStep("config-input")}
+        />
+      );
+
+    case "config-file":
+      return (
+        <ConfigFileStep
+          mode={config.mode}
+          onComplete={(configFile) => {
+            setConfig((c) => ({ ...c, configFile }));
+            setStep("setup-keys");
+          }}
+          onBack={() => setStep("config-output")}
         />
       );
 
@@ -1809,7 +2189,7 @@ function EvalApp({
             setConfig((c) => ({ ...c, envVars }));
             setStep("running");
           }}
-          onBack={() => setStep("config-output")}
+          onBack={() => setStep("config-file")}
         />
       );
 

@@ -21,24 +21,21 @@ from google.cloud.speech_v2 import SpeechClient
 from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
 from google.api_core.client_options import ClientOptions
 
-from loguru import logger
 import pandas as pd
 
 from calibrate.utils import (
-    log_and_print,
     get_stt_language_code,
     validate_stt_language,
-    configure_print_logger,
+    provider_log as _log,
+    provider_log_file as _current_log_file,
 )
 from calibrate.stt.metrics import (
     get_wer_score,
     get_llm_judge_score,
-    get_string_similarity,
 )
 from calibrate.judges import (
-    compat_llm_judge_score,
     is_rating,
-    DEFAULT_STT_CRITERIA,
+    DEFAULT_STT_EVALUATOR,
 )
 from calibrate.langfuse import (
     create_langfuse_audio_media,
@@ -288,7 +285,7 @@ async def transcribe_sarvam(audio_path: Path, language: str) -> str:
 
         # Force immediate processing
         await ws.flush()
-        print("⚡ Processing forced - getting immediate results")
+        _log("⚡ Processing forced - getting immediate results")
         # Get results
         async for message in ws:
             transcript = message.data.transcript
@@ -554,18 +551,18 @@ async def run_stt_eval(
 
         audio_path = audio_dir / f"{gt_info['id']}.wav"
 
-        log_and_print(f"--------------------------------")
-        log_and_print(f"Processing audio [{i + 1}/{len(gt_data)}]: {audio_path.name}")
+        _log(f"--------------------------------")
+        _log(f"Processing audio [{i + 1}/{len(gt_data)}]: {audio_path.name}")
 
         try:
             transcript = await transcribe_audio(
                 audio_path, gt_info["gt"], provider, language, unique_id
             )
-            log_and_print(f"\033[33mTranscript: {transcript}\033[0m")
+            _log(f"\033[33mTranscript: {transcript}\033[0m")
             if transcript:
                 success_count += 1
         except Exception as e:
-            log_and_print(f"\033[91mFailed to transcribe {audio_path}: {e}\033[0m")
+            _log(f"\033[91mFailed to transcribe {audio_path}: {e}\033[0m")
             raise
 
         # Save immediately after each file
@@ -735,207 +732,184 @@ async def run_single_provider_eval(
     debug_count: int,
     ignore_retry: bool,
     overwrite: bool,
-    judge_model: str = None,
-    judge_criteria: list[dict] = None,
+    judge_evaluators: list[dict] = None,
 ) -> dict:
     """Run STT evaluation for a single provider."""
     provider_output_dir = join(output_dir, provider)
 
-    if not exists(provider_output_dir):
-        os.makedirs(provider_output_dir)
+    # ``exist_ok=True`` keeps this safe when the same provider folder is
+    # created concurrently by multiple eval coroutines/subprocesses.
+    os.makedirs(provider_output_dir, exist_ok=True)
 
     log_save_path = join(provider_output_dir, "logs")
     if exists(log_save_path):
         os.remove(log_save_path)
 
-    logger.remove()
-    logger.add(log_save_path)
+    # Drop any stale results.log left over from the previous (loguru-based) layout
+    legacy_results_log = join(provider_output_dir, "results.log")
+    if exists(legacy_results_log):
+        os.remove(legacy_results_log)
 
-    print_log_save_path = join(provider_output_dir, "results.log")
-    if exists(print_log_save_path):
-        os.remove(print_log_save_path)
+    token = _current_log_file.set(log_save_path)
+    try:
+        _log("--------------------------------")
+        _log(f"\033[33mRunning STT evaluation for provider: {provider}\033[0m")
 
-    configure_print_logger(print_log_save_path)
+        # Validate language is supported by the provider
+        validate_stt_language(language, provider)
 
-    log_and_print("--------------------------------")
-    log_and_print(f"\033[33mRunning STT evaluation for provider: {provider}\033[0m")
+        # Audio files are expected in audios/*.wav
+        audio_dir = Path(input_dir) / "audios"
+        gt_file = join(input_dir, input_file_name)
+        results_csv_path = Path(provider_output_dir) / "results.csv"
 
-    # Validate language is supported by the provider
-    validate_stt_language(language, provider)
+        # Validate existing results.csv structure (if not overwriting)
+        if not overwrite:
+            is_valid, error_msg = validate_existing_results_csv(str(results_csv_path))
+            if not is_valid:
+                _log(f"\033[31mError: {error_msg}\033[0m")
+                return {"provider": provider, "status": "error", "error": error_msg}
 
-    # Audio files are expected in audios/*.wav
-    audio_dir = Path(input_dir) / "audios"
-    gt_file = join(input_dir, input_file_name)
-    results_csv_path = Path(provider_output_dir) / "results.csv"
+        # Delete existing results if overwrite is set
+        if overwrite and exists(results_csv_path):
+            os.remove(results_csv_path)
+            _log("Overwrite enabled - deleted existing results.csv")
 
-    # Validate existing results.csv structure (if not overwriting)
-    if not overwrite:
-        is_valid, error_msg = validate_existing_results_csv(str(results_csv_path))
-        if not is_valid:
-            log_and_print(f"\033[31mError: {error_msg}\033[0m")
-            return {"provider": provider, "status": "error", "error": error_msg}
+        gt = pd.read_csv(gt_file)
 
-    # Delete existing results if overwrite is set
-    if overwrite and exists(results_csv_path):
-        os.remove(results_csv_path)
-        log_and_print("Overwrite enabled - deleted existing results.csv")
+        if debug:
+            _log(
+                f"running in debug mode: using first {debug_count} audio files for evaluation",
+                to_terminal=False,
+            )
+            gt = gt.head(debug_count)
 
-    gt = pd.read_csv(gt_file)
+        total_expected = len(gt)
+        gt_data = [{"id": row["id"], "gt": row["text"]} for _, row in gt.iterrows()]
 
-    if debug:
-        logger.debug(
-            f"running in debug mode: using first {debug_count} audio files for evaluation"
-        )
-        gt = gt.head(debug_count)
+        # Process with retry loop
+        previous_processed_count = -1
 
-    total_expected = len(gt)
-    gt_data = [{"id": row["id"], "gt": row["text"]} for _, row in gt.iterrows()]
+        while True:
+            # Check current progress
+            if exists(results_csv_path):
+                current_df = pd.read_csv(results_csv_path)
+                current_processed = len(current_df)
 
-    # Process with retry loop
-    previous_processed_count = -1
+                if current_processed >= total_expected:
+                    _log(f"All {total_expected} audio files processed")
+                    break
 
-    while True:
-        # Check current progress
-        if exists(results_csv_path):
-            current_df = pd.read_csv(results_csv_path)
-            current_processed = len(current_df)
+                _log(f"Progress: {current_processed}/{total_expected} processed")
+            else:
+                current_processed = 0
 
-            if current_processed >= total_expected:
-                log_and_print(f"All {total_expected} audio files processed")
+            # Check if no progress was made
+            if current_processed == previous_processed_count:
+                _log(
+                    f"No progress made - {total_expected - current_processed} files failed. "
+                    f"Saving empty transcripts and exiting."
+                )
+                # Add empty transcripts for unprocessed files
+                if exists(results_csv_path):
+                    results = pd.read_csv(results_csv_path).to_dict("records")
+                    processed_ids = {r["id"] for r in results}
+                else:
+                    results = []
+                    processed_ids = set()
+
+                for gt_info in gt_data:
+                    if gt_info["id"] not in processed_ids:
+                        results.append(
+                            {"id": gt_info["id"], "gt": gt_info["gt"], "pred": ""}
+                        )
+
+                pd.DataFrame(results).to_csv(results_csv_path, index=False)
                 break
 
-            log_and_print(f"Progress: {current_processed}/{total_expected} processed")
-        else:
-            current_processed = 0
+            previous_processed_count = current_processed
 
-        # Check if no progress was made
-        if current_processed == previous_processed_count:
-            log_and_print(
-                f"No progress made - {total_expected - current_processed} files failed. "
-                f"Saving empty transcripts and exiting."
+            # Run transcription
+            success_count = await run_stt_eval(
+                gt_data=gt_data,
+                audio_dir=audio_dir,
+                provider=provider,
+                language=language,
+                results_csv_path=results_csv_path,
             )
-            # Add empty transcripts for unprocessed files
-            if exists(results_csv_path):
-                results = pd.read_csv(results_csv_path).to_dict("records")
-                processed_ids = {r["id"] for r in results}
-            else:
-                results = []
-                processed_ids = set()
 
-            for gt_info in gt_data:
-                if gt_info["id"] not in processed_ids:
-                    results.append(
-                        {"id": gt_info["id"], "gt": gt_info["gt"], "pred": ""}
-                    )
+            if ignore_retry:
+                break
 
-            pd.DataFrame(results).to_csv(results_csv_path, index=False)
-            break
+        # Load final results for metrics
+        results_df = pd.read_csv(results_csv_path)
+        all_ids = results_df["id"].tolist()
+        all_gt_transcripts = results_df["gt"].astype(str).tolist()
+        all_pred_transcripts = results_df["pred"].fillna("").astype(str).tolist()
 
-        previous_processed_count = current_processed
+        _log(f"gt_transcripts: {all_gt_transcripts}", to_terminal=False)
+        _log(f"pred_transcripts: {all_pred_transcripts}", to_terminal=False)
 
-        # Run transcription
-        success_count = await run_stt_eval(
-            gt_data=gt_data,
-            audio_dir=audio_dir,
-            provider=provider,
-            language=language,
-            results_csv_path=results_csv_path,
+        wer_results = get_wer_score(all_gt_transcripts, all_pred_transcripts)
+        _log(f"WER: {wer_results['score']}", to_terminal=False)
+
+        _evaluators = judge_evaluators if judge_evaluators else [DEFAULT_STT_EVALUATOR]
+        llm_results = await get_llm_judge_score(
+            all_gt_transcripts,
+            all_pred_transcripts,
+            evaluators=_evaluators,
         )
+        for name, score_dict in llm_results["scores"].items():
+            _log(f"  {name}: {score_dict['mean']:.4f}")
 
-        if ignore_retry:
-            break
+        # Map evaluator name → evaluator dict (for per-row value extraction)
+        _evaluators_by_name = {ev["name"]: ev for ev in _evaluators}
 
-    # Load final results for metrics
-    results_df = pd.read_csv(results_csv_path)
-    all_ids = results_df["id"].tolist()
-    all_gt_transcripts = results_df["gt"].astype(str).tolist()
-    all_pred_transcripts = results_df["pred"].fillna("").astype(str).tolist()
-
-    logger.info(f"gt_transcripts: {all_gt_transcripts}")
-    logger.info(f"pred_transcripts: {all_pred_transcripts}")
-
-    wer_results = get_wer_score(all_gt_transcripts, all_pred_transcripts)
-    logger.info(f"WER: {wer_results['score']}")
-
-    similarity_results = get_string_similarity(all_gt_transcripts, all_pred_transcripts)
-    logger.info(f"String Similarity: {similarity_results['score']}")
-
-    _judge_kwargs = {}
-    if judge_model:
-        _judge_kwargs["model"] = judge_model
-    if judge_criteria:
-        _judge_kwargs["criteria"] = judge_criteria
-    llm_results = await get_llm_judge_score(all_gt_transcripts, all_pred_transcripts, **_judge_kwargs)
-    logger.info(f"LLM Judge Score: {llm_results['score']}")
-
-    # Map criterion name → criterion dict (for per-row value extraction)
-    _criteria_by_name = {c["name"]: c for c in (judge_criteria or DEFAULT_STT_CRITERIA)}
-
-    metrics_data = {
-        "wer": wer_results["score"],
-        "string_similarity": similarity_results["score"],
-    }
-    # Per-criterion aggregate: scalar mean for chart compat, full dict under `_info`
-    for name, score_dict in llm_results["scores"].items():
-        metrics_data[f"{name}_score"] = score_dict["mean"]
-        metrics_data[f"{name}_info"] = score_dict
-    # Backward-compat aggregate: existing UI/report consumers read
-    # `llm_judge_score`. When the user keeps the default criterion name it's
-    # already populated above; otherwise fall back to a 0-1 normalized mean.
-    if "llm_judge_score" not in metrics_data:
-        compat = compat_llm_judge_score(llm_results["scores"])
-        if compat is not None:
-            metrics_data["llm_judge_score"] = compat
-
-    data = []
-    for _id, gt_text, pred_text, wer, sim, llm_row in zip(
-        all_ids,
-        all_gt_transcripts,
-        all_pred_transcripts,
-        wer_results["per_row"],
-        similarity_results["per_row"],
-        llm_results["per_row"],
-    ):
-        row = {
-            "id": _id,
-            "gt": gt_text,
-            "pred": pred_text,
-            "wer": wer,
-            "string_similarity": sim,
+        metrics_data = {
+            "wer": wer_results["score"],
         }
-        for name in llm_results["criteria_names"]:
-            c = _criteria_by_name[name]
-            crit_result = llm_row[name]
-            if is_rating(c):
-                row[f"{name}_score"] = crit_result["score"]
-            else:
-                row[f"{name}_score"] = bool(crit_result["match"])
-            row[f"{name}_reasoning"] = crit_result["reasoning"]
-        # Backward-compat per-row aggregate: True iff all binary criteria
-        # match. Rating criteria are informational (consistent with
-        # `passed` semantics in LLM tests). UI consumers reading
-        # `llm_judge_score` keep working with custom criterion names.
-        if "llm_judge_score" not in row:
-            binary_results = [
-                bool(llm_row[c["name"]]["match"])
-                for c in _criteria_by_name.values()
-                if not is_rating(c)
-            ]
-            row["llm_judge_score"] = all(binary_results) if binary_results else True
-        data.append(row)
+        # Per-criterion aggregate: scalar mean for chart compat, full dict under `_info`
+        for name, score_dict in llm_results["scores"].items():
+            metrics_data[f"{name}_score"] = score_dict["mean"]
+            metrics_data[f"{name}_info"] = score_dict
 
-    metrics_save_path = join(provider_output_dir, "metrics.json")
-    with open(metrics_save_path, "w") as f:
-        json.dump(metrics_data, f, indent=4)
+        data = []
+        for _id, gt_text, pred_text, wer, llm_row in zip(
+            all_ids,
+            all_gt_transcripts,
+            all_pred_transcripts,
+            wer_results["per_row"],
+            llm_results["per_row"],
+        ):
+            row = {
+                "id": _id,
+                "gt": gt_text,
+                "pred": pred_text,
+                "wer": wer,
+            }
+            for name, ev in _evaluators_by_name.items():
+                ev_result = llm_row[name]
+                if is_rating(ev):
+                    row[f"{name}_score"] = ev_result["score"]
+                else:
+                    row[f"{name}_score"] = bool(ev_result["match"])
+                row[f"{name}_reasoning"] = ev_result["reasoning"]
+            data.append(row)
 
-    pd.DataFrame(data).to_csv(join(provider_output_dir, "results.csv"), index=False)
+        metrics_save_path = join(provider_output_dir, "metrics.json")
+        with open(metrics_save_path, "w") as f:
+            json.dump(metrics_data, f, indent=4)
 
-    return {
-        "provider": provider,
-        "status": "completed",
-        "metrics": metrics_data,
-        "output_dir": provider_output_dir,
-    }
+        pd.DataFrame(data).to_csv(join(provider_output_dir, "results.csv"), index=False)
+
+        return {
+            "provider": provider,
+            "status": "completed",
+            "metrics": metrics_data,
+            "output_dir": provider_output_dir,
+        }
+    finally:
+        _current_log_file.reset(token)
 
 
 async def main():
@@ -999,7 +973,7 @@ async def main():
     parser.add_argument(
         "--ignore_retry",
         action="store_true",
-        help="Ignore retrying if all the audios are not processed and move on to LLM judge",
+        help="Ignore retrying if all the audios are not processed and move on to evaluators",
     )
     parser.add_argument(
         "--overwrite",
@@ -1023,8 +997,11 @@ async def main():
         print(f"\033[31mInput validation error: {error_msg}\033[0m")
         sys.exit(1)
 
-    if not exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    # ``exist_ok=True`` makes this safe when several ``calibrate stt``
+    # subprocesses race to create the output dir on first use; the previous
+    # ``if not exists: makedirs(...)`` pattern was non-atomic and the loser
+    # raised ``FileExistsError``.
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print("\n\033[91mSTT Evaluation\033[0m\n")
     print(f"Provider: {provider}")

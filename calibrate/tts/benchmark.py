@@ -27,6 +27,7 @@ from calibrate.tts.eval import (
     validate_tts_input_file,
 )
 from calibrate.tts.leaderboard import generate_leaderboard
+from calibrate.utils import StreamTee
 
 # Maximum number of providers to run in parallel
 MAX_PARALLEL_PROVIDERS = 2
@@ -58,8 +59,7 @@ async def run(
     debug_count: int = 5,
     overwrite: bool = False,
     max_parallel: int = MAX_PARALLEL_PROVIDERS,
-    judge_model: str = None,
-    judge_criteria: list[dict] = None,
+    judge_evaluators: list[dict] = None,
 ) -> dict:
     """
     Run TTS evaluation for multiple providers in parallel and generate a leaderboard.
@@ -75,8 +75,9 @@ async def run(
         debug_count: Number of texts to run in debug mode (default: 5)
         overwrite: Overwrite existing results instead of resuming from checkpoint (default: False)
         max_parallel: Maximum number of providers to run in parallel (default: 2)
-        judge_model: Optional model override for LLM judge
-        judge_criteria: Optional list of evaluation criteria dicts for multi-criteria judging
+        judge_evaluators: Optional list of evaluator dicts (each with ``name``,
+            ``system_prompt``, ``judge_model``, ``type``, ...). When omitted
+            the implicit default TTS evaluator runs.
 
     Returns:
         dict: Results summary with status and output paths
@@ -105,8 +106,7 @@ async def run(
                 debug=debug,
                 debug_count=debug_count,
                 overwrite=overwrite,
-                judge_model=judge_model,
-                judge_criteria=judge_criteria,
+                judge_evaluators=judge_evaluators,
             )
             return (provider, result)
 
@@ -190,7 +190,7 @@ async def main():
         "--config",
         type=str,
         default=None,
-        help="Path to optional JSON config file with judge settings (model, prompt)",
+        help="Path to optional JSON config file with an `evaluators` list",
     )
 
     args = parser.parse_args()
@@ -210,65 +210,81 @@ async def main():
         print(f"\033[31mInput validation error: {error_msg}\033[0m")
         sys.exit(1)
 
-    if not exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    # ``exist_ok=True`` makes this safe when several ``calibrate tts``
+    # subprocesses race to create the output dir on first use; the previous
+    # ``if not exists: makedirs(...)`` pattern was non-atomic and the loser
+    # raised ``FileExistsError``.
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    print("\n\033[91mTTS Benchmark\033[0m\n")
-    print(f"Provider(s): {', '.join(providers)}")
-    print(f"Language: {args.language}")
-    print(f"Input: {args.input}")
-    print(f"Output: {args.output_dir}")
-    print("")
+    # Mirror everything written to stdout/stderr into a single output-dir-level
+    # `logs` file so the full terminal session (header, per-provider output,
+    # tqdm progress, leaderboard prints, summary) is captured in one place.
+    log_path = join(args.output_dir, "logs")
+    if exists(log_path):
+        os.remove(log_path)
+    log_file = open(log_path, "w")
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = StreamTee(original_stdout, log_file)
+    sys.stderr = StreamTee(original_stderr, log_file)
 
-    # Load judge config from optional config file
-    judge_model = None
-    judge_criteria = None
-    if args.config:
-        import json as _json
-        with open(args.config) as _f:
-            _cfg = _json.load(_f)
-        judge_model = _cfg.get("judge", {}).get("model")
-        judge_criteria = _cfg.get("evaluation_criteria")
+    try:
+        print("\n\033[91mTTS Benchmark\033[0m\n")
+        print(f"Provider(s): {', '.join(providers)}")
+        print(f"Language: {args.language}")
+        print(f"Input: {args.input}")
+        print(f"Output: {args.output_dir}")
+        print("")
 
-    result = await run(
-        input=args.input,
-        providers=providers,
-        language=args.language,
-        output_dir=args.output_dir,
-        debug=args.debug,
-        debug_count=args.debug_count,
-        overwrite=args.overwrite,
-        judge_model=judge_model,
-        judge_criteria=judge_criteria,
-    )
+        # Load evaluators from optional config file
+        judge_evaluators = None
+        if args.config:
+            import json as _json
+            with open(args.config) as _f:
+                _cfg = _json.load(_f)
+            judge_evaluators = _cfg.get("evaluators")
 
-    # Print summary
-    print(f"\n\033[92m{'='*60}\033[0m")
-    print(f"\033[92mSummary\033[0m")
-    print(f"\033[92m{'='*60}\033[0m\n")
+        result = await run(
+            input=args.input,
+            providers=providers,
+            language=args.language,
+            output_dir=args.output_dir,
+            debug=args.debug,
+            debug_count=args.debug_count,
+            overwrite=args.overwrite,
+            judge_evaluators=judge_evaluators,
+        )
 
-    has_errors = False
-    for provider in providers:
-        provider_result = result["providers"].get(provider, {})
-        if isinstance(provider_result, dict):
-            if provider_result.get("status") == "error":
-                print(
-                    f"  {provider}: \033[31mError - {provider_result.get('error')}\033[0m"
-                )
-                has_errors = True
-            else:
-                metrics = provider_result.get("metrics", {})
-                judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
-                ttfb_data = metrics.get("ttfb", {})
-                ttfb_mean = ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"
-                judge_str = ", ".join(f"{k}={v:.2f}" for k, v in judge_scores.items())
-                ttfb_str = f"TTFB={ttfb_mean:.3f}s" if isinstance(ttfb_mean, float) else f"TTFB={ttfb_mean}"
-                print(f"  {provider}: {judge_str}, {ttfb_str}")
+        # Print summary
+        print(f"\n\033[92m{'='*60}\033[0m")
+        print(f"\033[92mSummary\033[0m")
+        print(f"\033[92m{'='*60}\033[0m\n")
 
-    print(f"\n\033[92mLeaderboard saved to {result['leaderboard_dir']}\033[0m")
+        has_errors = False
+        for provider in providers:
+            provider_result = result["providers"].get(provider, {})
+            if isinstance(provider_result, dict):
+                if provider_result.get("status") == "error":
+                    print(
+                        f"  {provider}: \033[31mError - {provider_result.get('error')}\033[0m"
+                    )
+                    has_errors = True
+                else:
+                    metrics = provider_result.get("metrics", {})
+                    judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+                    ttfb_data = metrics.get("ttfb", {})
+                    ttfb_mean = ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"
+                    judge_str = ", ".join(f"{k}={v:.2f}" for k, v in judge_scores.items())
+                    ttfb_str = f"TTFB={ttfb_mean:.3f}s" if isinstance(ttfb_mean, float) else f"TTFB={ttfb_mean}"
+                    print(f"  {provider}: {judge_str}, {ttfb_str}")
 
-    if has_errors:
-        sys.exit(1)
+        print(f"\n\033[92mLeaderboard saved to {result['leaderboard_dir']}\033[0m")
+
+        if has_errors:
+            sys.exit(1)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 
 if __name__ == "__main__":

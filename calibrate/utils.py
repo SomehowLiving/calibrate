@@ -149,6 +149,65 @@ def log_and_print(
         _print_logger.info(text)
 
 
+# =============================================================================
+# Per-provider Logging (shared by STT and TTS evaluations)
+# =============================================================================
+#
+# A single ``logs`` file is written per provider. Everything printed to the
+# terminal during that provider's run is mirrored into this file. There is no
+# separate ``results.log`` and no loguru sink — ``provider_log`` is the only
+# hook used inside the STT/TTS evaluation flows.
+
+provider_log_file: ContextVar[Optional[str]] = ContextVar(
+    "provider_log_file", default=None
+)
+
+
+def provider_log(message: object = "", *, to_terminal: bool = True) -> None:
+    """Append ``message`` to the per-provider log file and (by default) print it.
+
+    The active log file is resolved from ``provider_log_file`` (a
+    ``ContextVar``), so each provider running in parallel writes to its own
+    file without cross-contamination.
+    """
+    text = str(message)
+    if to_terminal:
+        print(text, flush=True)
+    log_path = provider_log_file.get()
+    if log_path:
+        with open(log_path, "a") as f:
+            f.write(text + "\n")
+
+
+class StreamTee:
+    """Mirror writes to the original stream and a log file.
+
+    Used by STT/TTS benchmarks to capture everything printed to
+    ``stdout``/``stderr`` during a run into an output-dir-level ``logs`` file,
+    without altering what the user sees on the terminal.
+    """
+
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log_file = log_file
+
+    def write(self, data):
+        self._original.write(data)
+        self._log_file.write(data)
+        return len(data) if isinstance(data, str) else 0
+
+    def flush(self):
+        self._original.flush()
+        self._log_file.flush()
+
+    def isatty(self):
+        # Preserve TTY semantics so tqdm keeps rendering as a progress bar
+        return getattr(self._original, "isatty", lambda: False)()
+
+    def __getattr__(self, item):
+        return getattr(self._original, item)
+
+
 async def save_audio_chunk(
     path: str, audio_chunk: bytes, sample_rate: int, num_channels: int
 ):

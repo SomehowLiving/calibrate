@@ -659,9 +659,9 @@ export function CreateMetricFlow({
   return (
     <Box flexDirection="column" padding={1}>
       {header}
-      <Text>Evaluation instructions for the LLM judge:</Text>
+      <Text>Evaluation instructions for the evaluator:</Text>
       <Text dimColor>
-        Describe what "pass" vs "fail" looks like — this is sent to an LLM judge
+        Describe what "pass" vs "fail" looks like — this is sent to an evaluator
         to score each simulation.
       </Text>
       <Box marginTop={1}>

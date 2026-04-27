@@ -12,7 +12,7 @@ Library Usage:
         tools=[...],
         personas=[...],
         scenarios=[...],
-        evaluation_criteria=[...],
+        evaluators=[...],
         output_dir="./out"
     ))
 """
@@ -71,7 +71,7 @@ class _Simulation:
         tools: List[dict],
         personas: List[dict],
         scenarios: List[dict],
-        evaluation_criteria: List[dict],
+        evaluators: List[dict],
         output_dir: str = "./out",
         stt: Optional[STTConfig] = None,
         tts: Optional[TTSConfig] = None,
@@ -79,7 +79,6 @@ class _Simulation:
         agent_speaks_first: bool = True,
         max_turns: int = 50,
         port: int = 8765,
-        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run voice agent simulations with the given configuration.
@@ -89,7 +88,7 @@ class _Simulation:
             tools: List of tool definitions available to the agent
             personas: List of persona dicts with 'characteristics', 'gender', 'language', optional 'interruption_sensitivity'
             scenarios: List of scenario dicts with 'description'
-            evaluation_criteria: List of criteria dicts with 'name' and 'description'
+            evaluators: List of evaluator dicts with 'name', 'system_prompt', and optional 'judge_model'/'type'/'scale_min'/'scale_max'
             output_dir: Path to output directory for results (default: ./out)
             stt: STT configuration (default: Google)
             tts: TTS configuration (default: Google)
@@ -114,7 +113,7 @@ class _Simulation:
             ...         "interruption_sensitivity": "medium"
             ...     }],
             ...     scenarios=[{"description": "User completes the form"}],
-            ...     evaluation_criteria=[{"name": "completeness", "description": "All questions answered"}],
+            ...     evaluators=[{"name": "completeness", "system_prompt": "Evaluate whether all questions were answered..."}],
             ...     output_dir="./out",
             ...     stt=STTConfig(provider="google"),
             ...     tts=TTSConfig(provider="google"),
@@ -132,7 +131,7 @@ class _Simulation:
             "tools": tools,
             "personas": personas,
             "scenarios": scenarios,
-            "evaluation_criteria": evaluation_criteria,
+            "evaluators": evaluators or [],
             "settings": {
                 "agent_speaks_first": agent_speaks_first,
                 "max_turns": max_turns,
@@ -145,8 +144,6 @@ class _Simulation:
             config["tts"] = tts.to_dict() if hasattr(tts, "to_dict") else tts
         if llm:
             config["llm"] = llm.to_dict() if hasattr(llm, "to_dict") else llm
-        if judge:
-            config["judge"] = judge
 
         # Mapping from interruption_sensitivity labels to probabilities
         interrupt_sensitivity_map = {
@@ -280,13 +277,12 @@ class _Simulation:
         system_prompt: str,
         language: Literal["english", "hindi"],
         gender: Literal["male", "female"],
-        evaluation_criteria: List[dict],
+        evaluators: List[dict],
         output_dir: str,
         interrupt_probability: float = 0.0,
         port: int = 8765,
         agent_speaks_first: bool = True,
         max_turns: int = 50,
-        judge: Optional[Dict[str, str]] = None,
     ) -> dict:
         """
         Run a single voice agent simulation.
@@ -295,7 +291,7 @@ class _Simulation:
             system_prompt: System prompt for the simulated user
             language: Language for the simulation (english or hindi)
             gender: Gender for TTS voice selection
-            evaluation_criteria: List of evaluation criteria dicts
+            evaluators: List of evaluator dicts with 'name', 'system_prompt', and optional 'judge_model'/'type'/'scale_min'/'scale_max'
             output_dir: Output directory for results
             interrupt_probability: Probability of user interrupting the agent (0.0-1.0)
             port: WebSocket port for the simulation
@@ -312,36 +308,22 @@ class _Simulation:
             ...     system_prompt="You are simulating a user...",
             ...     language="english",
             ...     gender="female",
-            ...     evaluation_criteria=[{"name": "completeness", "description": "..."}],
+            ...     evaluators=[{"name": "completeness", "system_prompt": "..."}],
             ...     output_dir="./out"
             ... ))
         """
         from calibrate.agent.run_simulation import run_simulation as _run_simulation
-        from calibrate.llm.metrics import DEFAULT_SIMULATION_JUDGE_MODEL
-        from calibrate.stt.metrics import DEFAULT_STT_JUDGE_MODEL
-
-        kwargs = {}
-        if judge:
-            if judge.get("model"):
-                kwargs["judge_model"] = judge["model"]
-            # STT judge falls back to judge.model when stt_model is omitted,
-            # matching the config-driven simulation flow in
-            # calibrate/agent/run_simulation.py::_run_single_simulation_inner.
-            stt_model = judge.get("stt_model") or judge.get("model")
-            if stt_model:
-                kwargs["stt_judge_model"] = stt_model
 
         return await _run_simulation(
             system_prompt=system_prompt,
             language=language,
             gender=gender,
-            evaluation_criteria=evaluation_criteria,
+            evaluators=evaluators or [],
             output_dir=output_dir,
             interrupt_probability=interrupt_probability,
             port=port,
             agent_speaks_first=agent_speaks_first,
             max_turns=max_turns,
-            **kwargs,
         )
 
 

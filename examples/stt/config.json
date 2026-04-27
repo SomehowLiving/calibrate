@@ -1,18 +1,17 @@
 {
-  "judge": {
-    "model": "openai/gpt-4.1"
-  },
-  "evaluation_criteria": [
+  "evaluators": [
     {
       "name": "semantic_match",
-      "description": "Check whether the values represented by both strings match semantically. E.g. '1,2,3' matches 'one, two, three'. Ignore formatting differences like extra spaces. If all values match, mark as True."
+      "system_prompt": "You are a highly accurate evaluator that compares an STT transcription against the source text.\n\nYou will be given a source text and a transcription. Check whether the values represented by both strings match semantically. E.g. '1,2,3' matches 'one, two, three'. Ignore formatting differences like extra spaces. If all values match, mark as True.",
+      "judge_model": "openai/gpt-5.4-mini"
     },
     {
       "name": "transcription_quality",
+      "system_prompt": "You are a highly accurate evaluator that rates the overall quality of an STT transcription against its source.\n\nYou will be given a source text and a transcription. Rate overall transcription quality on a 1-5 scale: 1 (unusable), 3 (some errors but gist preserved), 5 (word-perfect).",
+      "judge_model": "openai/gpt-5.4-mini",
       "type": "rating",
       "scale_min": 1,
-      "scale_max": 5,
-      "description": "Rate overall transcription quality: 1 (unusable), 3 (some errors but gist preserved), 5 (word-perfect)."
+      "scale_max": 5
     }
   ]
 }

@@ -175,47 +175,15 @@ For agent connection, your agent owns its tools internally — there is no need 
 
 ---
 
-## Judge configuration
+## Evaluator configuration
 
-By default, response-type test cases are evaluated by a text LLM judge that routes through [OpenRouter](https://openrouter.ai/) — set `OPENROUTER_API_KEY` in your environment. You can override the judge model via an optional top-level `judge` key:
+Response-type test cases are evaluated by a text LLM judge that routes through [OpenRouter](https://openrouter.ai/) — set `OPENROUTER_API_KEY` in your environment.
 
-| Key     | Type   | Description                                                        |
-| ------- | ------ | ------------------------------------------------------------------ |
-| `model` | string | OpenRouter model id used by the LLM judge (default: `openai/gpt-4.1`). Use any model in the [OpenRouter catalog](https://openrouter.ai/models). |
+Each evaluator's `system_prompt` is sent as the system message to its own dedicated LLM judge call (one call per evaluator, run in parallel). The user message contains the conversation history and the agent's response.
 
-```json
-{
-  "judge": {
-    "model": "openai/gpt-4.1"
-  }
-}
-```
+### Quick start: single criterion
 
-### Multi-criteria evaluation
-
-By default, each response test case uses a single criterion. You can evaluate multiple dimensions by passing an array of criteria instead of a string:
-
-```json
-{
-  "evaluation": {
-    "type": "response",
-    "criteria": [
-      {
-        "name": "accuracy",
-        "description": "The response is factually correct and relevant"
-      },
-      {
-        "name": "tone",
-        "description": "The response is professional and friendly"
-      }
-    ]
-  }
-}
-```
-
-Each criterion is scored independently by the judge. A test case passes only when **all** binary criteria match.
-
-The single-string format still works for simple cases:
+The simplest setup needs no top-level `evaluators`. Pass `criteria` as a string and the implicit `criteria-passed` evaluator runs. The string is substituted into the default evaluator's system prompt as the `{{criteria}}` variable:
 
 ```json
 {
@@ -226,41 +194,89 @@ The single-string format still works for simple cases:
 }
 ```
 
-### Rating criteria (non-binary scoring)
+### Defining custom evaluators
 
-Criteria default to **binary** (pass/fail). For dimensions that are better measured on a scale (fluency, politeness, naturalness), set `type: "rating"` and define the scale:
+Define one or more evaluators at the top level and reference them by name from each test case. Each evaluator is an independent LLM call and produces its own column in the leaderboard:
 
 ```json
 {
-  "evaluation": {
-    "type": "response",
-    "criteria": [
-      {
-        "name": "accuracy",
-        "description": "The response is factually correct"
-      },
-      {
-        "name": "tone",
-        "type": "rating",
-        "scale_min": 1,
-        "scale_max": 5,
-        "description": "Rate the tone: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful"
+  "evaluators": [
+    {
+      "name": "accuracy",
+      "system_prompt": "You are a highly accurate evaluator. You will be given a conversation and the agent's final response. Mark True if the response is factually correct and relevant.",
+      "judge_model": "openai/gpt-4.1"
+    },
+    {
+      "name": "tone",
+      "system_prompt": "You are a highly accurate evaluator. You will be given a conversation and the agent's final response. Rate the tone on a 1-5 scale: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful.",
+      "judge_model": "openai/gpt-4.1",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5
+    }
+  ],
+  "test_cases": [
+    {
+      "history": [...],
+      "evaluation": {
+        "type": "response",
+        "criteria": [
+          { "name": "accuracy" },
+          { "name": "tone" }
+        ]
       }
-    ]
-  }
+    }
+  ]
 }
 ```
 
-| Key         | Type    | Description                                                                     |
-| ----------- | ------- | ------------------------------------------------------------------------------- |
-| `type`      | string  | `"binary"` (default) or `"rating"`                                              |
-| `scale_min` | integer | Lowest allowed score (required for rating criteria)                             |
-| `scale_max` | integer | Highest allowed score (required for rating criteria)                            |
+| Key                          | Type   | Description                                                                                |
+| ---------------------------- | ------ | ------------------------------------------------------------------------------------------ |
+| `evaluators`                 | array  | Top-level list of evaluators. Each one becomes its own LLM call per test case.             |
+| `evaluators[].name`          | string | Unique evaluator name. Test cases reference it via `evaluation.criteria[].name`.           |
+| `evaluators[].system_prompt` | string | Full system prompt for this evaluator. Supports `{{var}}` placeholders that are substituted from the test case's `arguments`. |
+| `evaluators[].judge_model`   | string | OpenRouter model id for this evaluator (default: `openai/gpt-4.1`).                        |
+| `evaluators[].type`          | string | `"binary"` (default) or `"rating"`.                                                        |
+| `evaluators[].scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                 |
+| `evaluators[].scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                |
 
-Rating criteria are **informational**: they produce a mean score per model in the leaderboard but don't affect the test case's pass/fail flag. Only binary criteria determine pass/fail. Use a binary criterion like `"is the tone rating at least 4?"` if you want to gate on a score.
+### Variable substitution
+
+A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in the evaluator's `system_prompt` is replaced with the matching value before the judge call:
+
+```json
+{
+  "evaluators": [
+    {
+      "name": "criteria-passed",
+      "system_prompt": "You are a highly accurate evaluator. Evaluate whether the agent's response satisfies: {{criteria}}",
+      "judge_model": "openai/gpt-4.1"
+    }
+  ],
+  "test_cases": [
+    {
+      "history": [...],
+      "evaluation": {
+        "type": "response",
+        "criteria": [
+          { "name": "criteria-passed", "arguments": { "criteria": "Politely redirect off-topic questions." } }
+        ]
+      }
+    }
+  ]
+}
+```
+
+The string-form `criteria` (shown in the quick start above) is just a shortcut for the implicit `criteria-passed` evaluator with `{ "arguments": { "criteria": "<your string>" } }`.
+
+### Binary vs rating
+
+Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluators produce an integer score on your scale and a mean score in the leaderboard.
+
+A test case passes only when **all** binary evaluators match. Rating evaluators are **informational** — they produce a mean score per model but don't affect pass/fail. Use a binary evaluator like `"is the tone rating at least 4?"` if you want to gate on a score.
 
 <Note>
-  The `judge` key is optional. When omitted, the built-in defaults are used.
+  The `evaluators` key is optional. When omitted, the implicit `criteria-passed` evaluator is used and `criteria` may be passed as a plain string.
 </Note>
 
 ---

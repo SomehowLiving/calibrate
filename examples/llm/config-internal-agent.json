@@ -24,12 +24,12 @@
       "type": "webhook",
       "name": "check_order",
       "description": "Check the status of a customer order by order ID",
-      "parameters": [],
+      "parameters": [ ],
       "webhook": {
         "method": "GET",
         "url": "https://api.example.com/orders",
         "timeout": 10,
-        "headers": [{ "name": "Authorization", "value": "Bearer API_KEY" }],
+        "headers": [ { "name": "Authorization", "value": "Bearer API_KEY" } ],
         "queryParameters": [
           {
             "id": "order_id",
@@ -41,9 +41,21 @@
       }
     }
   ],
-  "judge": {
-    "model": "openai/gpt-4.1"
-  },
+  "evaluators": [
+    {
+      "name": "relevance",
+      "system_prompt": "You are a highly accurate evaluator evaluating the response to a conversation.\n\nYou will be given a conversation between a user and a human agent along with the response of the human agent to the final user message.\n\nMark True if the assistant's response is about product availability or asks for more details about the laptop.",
+      "judge_model": "openai/gpt-4.1"
+    },
+    {
+      "name": "tone",
+      "system_prompt": "You are a highly accurate evaluator evaluating the response to a conversation.\n\nYou will be given a conversation between a user and a human agent along with the response of the human agent to the final user message.\n\nRate the tone on a 1-5 scale: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful.",
+      "judge_model": "openai/gpt-4.1",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5
+    }
+  ],
   "test_cases": [
     {
       "history": [
@@ -61,8 +73,9 @@
         "tool_calls": [
           {
             "tool": "check_order",
-            "arguments": {
-              "order_id": "ORD-12345"
+            "arguments": { "query": {
+                "order_id": "ORD-12345"
+              }
             }
           }
         ]
@@ -122,17 +135,8 @@
       "evaluation": {
         "type": "response",
         "criteria": [
-          {
-            "name": "relevance",
-            "description": "The assistant should respond about product availability or ask for more details about the laptop."
-          },
-          {
-            "name": "tone",
-            "type": "rating",
-            "scale_min": 1,
-            "scale_max": 5,
-            "description": "Rate the tone on a 1-5 scale: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful."
-          }
+          { "name": "relevance" },
+          { "name": "tone" }
         ]
       }
     }

@@ -18,10 +18,25 @@ export type LlmStep =
   | "leaderboard";
 
 // ─── Interfaces ───────────────────────────────────────────────
+
+// Per-evaluator aggregate parsed from a model's metrics.json `criteria` block.
+// Binary evaluators contribute pass_rate; rating evaluators contribute mean.
+// `display` is the formatted string ready for table/inline display.
+export type EvaluatorAggregate = {
+  type: "binary" | "rating";
+  display: string; // e.g. "80.0%" (binary) or "4.20/5" (rating: mean/scale_max)
+  sortValue: number;
+};
+
 export interface ModelState {
   status: "waiting" | "running" | "done" | "error";
   logs: string[];
-  metrics?: { passed?: number; failed?: number; total?: number };
+  metrics?: {
+    passed?: number;
+    failed?: number;
+    total?: number;
+    evaluators?: Record<string, EvaluatorAggregate>;
+  };
 }
 
 export interface HistoryMessage {
@@ -34,6 +49,15 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
+// Per-evaluator result keyed by evaluator name. Binary evaluators have a
+// ``match`` boolean; rating evaluators have a numeric ``score``. Both have
+// ``reasoning``.
+export type JudgeEvaluatorResult = {
+  match?: boolean;
+  score?: number;
+  reasoning?: string;
+};
+
 export interface TestResult {
   id: string;
   history: HistoryMessage[];
@@ -42,6 +66,7 @@ export interface TestResult {
   actualOutput: string;
   passed: boolean;
   reasoning: string;
+  judgeResults?: Record<string, JudgeEvaluatorResult>;
 }
 
 export interface LlmConfig {

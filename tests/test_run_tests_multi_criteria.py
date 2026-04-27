@@ -1,11 +1,10 @@
 """
-Tests for multi-criteria LLM test evaluation.
+Tests for multi-evaluator LLM test evaluation.
 
 Covers:
-- run_test_external with list-of-criteria returns per-criterion judge_results
-- run_test_external with string criteria falls back to flat {reasoning, match}
-- "passed" is True iff ALL criteria match
-- _aggregate_criteria aggregates pass rates correctly across test cases
+- run_test_external with multi-evaluator returns per-evaluator judge_results
+- "passed" is True iff ALL binary evaluators match (rating evaluators are informational)
+- _aggregate_criteria aggregates pass rates / rating means correctly across test cases
 
 Run with:
     python -m pytest tests/test_run_tests_multi_criteria.py -v
@@ -37,20 +36,39 @@ def _patch_httpx(response_body: dict, status: int = 200):
     return patch("httpx.AsyncClient", return_value=mock_client), mock_client
 
 
+def _binary_ev(name: str) -> dict:
+    return {"name": name, "system_prompt": f"eval {name}", "judge_model": "openai/gpt-4.1"}
+
+
+def _rating_ev(name: str, lo: int = 1, hi: int = 5) -> dict:
+    return {
+        "name": name,
+        "system_prompt": f"rate {name}",
+        "judge_model": "openai/gpt-4.1",
+        "type": "rating",
+        "scale_min": lo,
+        "scale_max": hi,
+    }
+
+
 # ---------------------------------------------------------------------------
-# run_test_external with multi-criteria
+# run_test_external with multi-evaluator
 # ---------------------------------------------------------------------------
 
 
 class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
 
-    async def _run(self, agent_response, criteria, judge_result):
+    async def _run(self, agent_response, evaluators, judge_result, criteria=None):
         from calibrate.connections import TextAgentConnection
         from calibrate.llm.run_tests import run_test_external
 
         agent = TextAgentConnection(url="http://fake-agent/chat")
         fake_body = {"response": agent_response, "tool_calls": []}
-        evaluation = {"type": "response", "criteria": criteria}
+        evaluation = {
+            "type": "response",
+            "criteria": criteria
+            or [{"name": ev["name"]} for ev in evaluators],
+        }
 
         mock_judge = AsyncMock(return_value=judge_result)
         ctx, _ = _patch_httpx(fake_body)
@@ -61,15 +79,13 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
                 chat_history=[{"role": "user", "content": "Hi"}],
                 evaluation=evaluation,
                 agent=agent,
+                evaluators=evaluators,
             )
 
-    async def test_all_criteria_match_passes(self):
+    async def test_all_evaluators_match_passes(self):
         result = await self._run(
             agent_response="Hello, how can I help?",
-            criteria=[
-                {"name": "greeting", "description": "agent greets"},
-                {"name": "helpful", "description": "offers help"},
-            ],
+            evaluators=[_binary_ev("greeting"), _binary_ev("helpful")],
             judge_result={
                 "greeting": {"match": True, "reasoning": "greeted"},
                 "helpful": {"match": True, "reasoning": "offered help"},
@@ -84,20 +100,17 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
             result["metrics"]["judge_results"]["helpful"]["match"], True
         )
 
-    async def test_one_criterion_fails_overall_fails(self):
+    async def test_one_evaluator_fails_overall_fails(self):
         result = await self._run(
             agent_response="Hello.",
-            criteria=[
-                {"name": "greeting", "description": "agent greets"},
-                {"name": "helpful", "description": "offers help"},
-            ],
+            evaluators=[_binary_ev("greeting"), _binary_ev("helpful")],
             judge_result={
                 "greeting": {"match": True, "reasoning": "greeted"},
                 "helpful": {"match": False, "reasoning": "did not offer help"},
             },
         )
         self.assertFalse(result["metrics"]["passed"])
-        # Reasoning surfaces the first failing criterion
+        # Reasoning surfaces the first failing evaluator
         self.assertEqual(
             result["metrics"]["reasoning"], "did not offer help"
         )
@@ -105,10 +118,7 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
     async def test_all_fail(self):
         result = await self._run(
             agent_response="go away",
-            criteria=[
-                {"name": "greeting", "description": "agent greets"},
-                {"name": "helpful", "description": "offers help"},
-            ],
+            evaluators=[_binary_ev("greeting"), _binary_ev("helpful")],
             judge_result={
                 "greeting": {"match": False, "reasoning": "no greeting"},
                 "helpful": {"match": False, "reasoning": "not helpful"},
@@ -116,44 +126,23 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result["metrics"]["passed"])
 
-    async def test_single_string_criteria_still_works(self):
-        """Backward compat: string criteria returns flat {reasoning, match}."""
-        result = await self._run(
-            agent_response="Hello!",
-            criteria="Agent should greet",
-            judge_result={"match": True, "reasoning": "greeted"},
-        )
-        self.assertTrue(result["metrics"]["passed"])
-        self.assertEqual(result["metrics"]["reasoning"], "greeted")
-        # When criteria was string, judge_results should NOT be set
-        self.assertNotIn("judge_results", result["metrics"])
-
     async def test_all_pass_reasoning_message(self):
         result = await self._run(
             agent_response="Hello, how can I help?",
-            criteria=[
-                {"name": "greeting", "description": "agent greets"},
-            ],
+            evaluators=[_binary_ev("greeting")],
             judge_result={
                 "greeting": {"match": True, "reasoning": "greeted"},
             },
         )
         self.assertEqual(
-            result["metrics"]["reasoning"], "All criteria passed"
+            result["metrics"]["reasoning"], "All evaluators passed"
         )
 
-    async def test_rating_criterion_does_not_affect_passed_flag(self):
-        """Rating criteria are informational — they don't fail the test."""
-        rating = {
-            "name": "fluency",
-            "type": "rating",
-            "scale_min": 1,
-            "scale_max": 5,
-            "description": "rate",
-        }
+    async def test_rating_evaluator_does_not_affect_passed_flag(self):
+        """Rating evaluators are informational — they don't fail the test."""
         result = await self._run(
             agent_response="Hello!",
-            criteria=[rating],
+            evaluators=[_rating_ev("fluency")],
             judge_result={"fluency": {"score": 2, "reasoning": "meh"}},
         )
         # Low rating score does NOT fail the test
@@ -163,18 +152,10 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_mixed_binary_fails_overrides_rating(self):
-        """A failing binary criterion fails the test even if rating is high."""
-        binary = {"name": "accuracy", "description": "correct"}
-        rating = {
-            "name": "fluency",
-            "type": "rating",
-            "scale_min": 1,
-            "scale_max": 5,
-            "description": "rate",
-        }
+        """A failing binary evaluator fails the test even if rating is high."""
         result = await self._run(
             agent_response="wrong answer",
-            criteria=[binary, rating],
+            evaluators=[_binary_ev("accuracy"), _rating_ev("fluency")],
             judge_result={
                 "accuracy": {"match": False, "reasoning": "wrong"},
                 "fluency": {"score": 5, "reasoning": "very fluent"},
@@ -190,9 +171,16 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAggregateCriteria(unittest.TestCase):
+    def _registry(self, *evaluators) -> dict:
+        from calibrate.judges import DEFAULT_LLM_TEST_EVALUATOR
+        reg = {DEFAULT_LLM_TEST_EVALUATOR["name"]: DEFAULT_LLM_TEST_EVALUATOR}
+        for ev in evaluators:
+            reg[ev["name"]] = ev
+        return reg
+
     def test_empty_list_returns_empty_dict(self):
         from calibrate.llm.run_tests import _aggregate_criteria
-        self.assertEqual(_aggregate_criteria([]), {})
+        self.assertEqual(_aggregate_criteria([], self._registry()), {})
 
     def test_tool_call_tests_excluded(self):
         from calibrate.llm.run_tests import _aggregate_criteria
@@ -206,28 +194,43 @@ class TestAggregateCriteria(unittest.TestCase):
                 "test_case": {"evaluation": {"type": "tool_call"}},
             },
         ]
-        self.assertEqual(_aggregate_criteria(results), {})
+        self.assertEqual(_aggregate_criteria(results, self._registry()), {})
 
-    def test_string_criteria_aggregates_under_criteria_key(self):
+    def test_string_criteria_aggregates_under_default_evaluator(self):
+        """String criteria are normalized to the implicit ``criteria-passed`` evaluator."""
         from calibrate.llm.run_tests import _aggregate_criteria
         results = [
             {
-                "metrics": {"passed": True, "reasoning": "ok"},
+                "metrics": {
+                    "passed": True,
+                    "reasoning": "ok",
+                    "judge_results": {
+                        "criteria-passed": {"match": True, "reasoning": "ok"},
+                    },
+                },
                 "test_case": {"evaluation": {"type": "response", "criteria": "X"}},
             },
             {
-                "metrics": {"passed": False, "reasoning": "bad"},
+                "metrics": {
+                    "passed": False,
+                    "reasoning": "bad",
+                    "judge_results": {
+                        "criteria-passed": {"match": False, "reasoning": "bad"},
+                    },
+                },
                 "test_case": {"evaluation": {"type": "response", "criteria": "Y"}},
             },
         ]
-        agg = _aggregate_criteria(results)
-        self.assertIn("criteria", agg)
-        self.assertEqual(agg["criteria"]["passed"], 1)
-        self.assertEqual(agg["criteria"]["total"], 2)
-        self.assertEqual(agg["criteria"]["pass_rate"], 50.0)
+        agg = _aggregate_criteria(results, self._registry())
+        self.assertIn("criteria-passed", agg)
+        self.assertEqual(agg["criteria-passed"]["passed"], 1)
+        self.assertEqual(agg["criteria-passed"]["total"], 2)
+        self.assertEqual(agg["criteria-passed"]["pass_rate"], 50.0)
 
-    def test_multi_criteria_counted_independently(self):
+    def test_multi_evaluators_counted_independently(self):
         from calibrate.llm.run_tests import _aggregate_criteria
+        accuracy = _binary_ev("accuracy")
+        tone = _binary_ev("tone")
         results = [
             {
                 "metrics": {
@@ -242,14 +245,14 @@ class TestAggregateCriteria(unittest.TestCase):
                     "evaluation": {
                         "type": "response",
                         "criteria": [
-                            {"name": "accuracy", "description": "a"},
-                            {"name": "tone", "description": "t"},
+                            {"name": "accuracy"},
+                            {"name": "tone"},
                         ],
                     }
                 },
             },
         ]
-        agg = _aggregate_criteria(results)
+        agg = _aggregate_criteria(results, self._registry(accuracy, tone))
         self.assertEqual(
             agg["accuracy"],
             {"type": "binary", "passed": 1, "total": 1, "pass_rate": 100.0},
@@ -259,20 +262,14 @@ class TestAggregateCriteria(unittest.TestCase):
             {"type": "binary", "passed": 0, "total": 1, "pass_rate": 0.0},
         )
 
-    def test_rating_criterion_aggregates_mean(self):
+    def test_rating_evaluator_aggregates_mean(self):
         from calibrate.llm.run_tests import _aggregate_criteria
-        rating_criterion = {
-            "name": "fluency",
-            "type": "rating",
-            "scale_min": 1,
-            "scale_max": 5,
-            "description": "rate",
-        }
+        fluency = _rating_ev("fluency")
         results = [
             {
                 "metrics": {
                     "passed": True,
-                    "reasoning": "All criteria passed",
+                    "reasoning": "All evaluators passed",
                     "judge_results": {
                         "fluency": {"score": 4, "reasoning": "ok"},
                     },
@@ -280,14 +277,14 @@ class TestAggregateCriteria(unittest.TestCase):
                 "test_case": {
                     "evaluation": {
                         "type": "response",
-                        "criteria": [rating_criterion],
+                        "criteria": [{"name": "fluency"}],
                     }
                 },
             },
             {
                 "metrics": {
                     "passed": True,
-                    "reasoning": "All criteria passed",
+                    "reasoning": "All evaluators passed",
                     "judge_results": {
                         "fluency": {"score": 2, "reasoning": "ok"},
                     },
@@ -295,12 +292,12 @@ class TestAggregateCriteria(unittest.TestCase):
                 "test_case": {
                     "evaluation": {
                         "type": "response",
-                        "criteria": [rating_criterion],
+                        "criteria": [{"name": "fluency"}],
                     }
                 },
             },
         ]
-        agg = _aggregate_criteria(results)
+        agg = _aggregate_criteria(results, self._registry(fluency))
         self.assertEqual(
             agg["fluency"],
             {
@@ -314,21 +311,15 @@ class TestAggregateCriteria(unittest.TestCase):
             },
         )
 
-    def test_mixed_binary_and_rating_criteria(self):
+    def test_mixed_binary_and_rating_evaluators(self):
         from calibrate.llm.run_tests import _aggregate_criteria
-        binary = {"name": "accuracy", "description": "correct"}
-        rating = {
-            "name": "fluency",
-            "type": "rating",
-            "scale_min": 1,
-            "scale_max": 5,
-            "description": "rate",
-        }
+        accuracy = _binary_ev("accuracy")
+        fluency = _rating_ev("fluency")
         results = [
             {
                 "metrics": {
                     "passed": True,
-                    "reasoning": "All criteria passed",
+                    "reasoning": "All evaluators passed",
                     "judge_results": {
                         "accuracy": {"match": True, "reasoning": "ok"},
                         "fluency": {"score": 5, "reasoning": "ok"},
@@ -337,12 +328,15 @@ class TestAggregateCriteria(unittest.TestCase):
                 "test_case": {
                     "evaluation": {
                         "type": "response",
-                        "criteria": [binary, rating],
+                        "criteria": [
+                            {"name": "accuracy"},
+                            {"name": "fluency"},
+                        ],
                     }
                 },
             },
         ]
-        agg = _aggregate_criteria(results)
+        agg = _aggregate_criteria(results, self._registry(accuracy, fluency))
         self.assertEqual(agg["accuracy"]["type"], "binary")
         self.assertEqual(agg["accuracy"]["pass_rate"], 100.0)
         self.assertEqual(agg["fluency"]["type"], "rating")
@@ -350,15 +344,23 @@ class TestAggregateCriteria(unittest.TestCase):
         self.assertEqual(agg["fluency"]["scale_min"], 1)
         self.assertEqual(agg["fluency"]["scale_max"], 5)
 
-    def test_mixed_single_and_multi_criteria(self):
+    def test_mixed_string_and_multi_evaluator_criteria(self):
         from calibrate.llm.run_tests import _aggregate_criteria
+        accuracy = _binary_ev("accuracy")
+        tone = _binary_ev("tone")
         results = [
             # Response test — string criteria (passes)
             {
-                "metrics": {"passed": True, "reasoning": "ok"},
+                "metrics": {
+                    "passed": True,
+                    "reasoning": "ok",
+                    "judge_results": {
+                        "criteria-passed": {"match": True, "reasoning": "ok"},
+                    },
+                },
                 "test_case": {"evaluation": {"type": "response", "criteria": "X"}},
             },
-            # Response test — multi-criteria (one passes, one fails)
+            # Response test — multi-evaluator (one passes, one fails)
             {
                 "metrics": {
                     "passed": False,
@@ -372,8 +374,8 @@ class TestAggregateCriteria(unittest.TestCase):
                     "evaluation": {
                         "type": "response",
                         "criteria": [
-                            {"name": "accuracy", "description": "a"},
-                            {"name": "tone", "description": "t"},
+                            {"name": "accuracy"},
+                            {"name": "tone"},
                         ],
                     }
                 },
@@ -384,11 +386,65 @@ class TestAggregateCriteria(unittest.TestCase):
                 "test_case": {"evaluation": {"type": "tool_call"}},
             },
         ]
-        agg = _aggregate_criteria(results)
-        self.assertEqual(set(agg.keys()), {"criteria", "accuracy", "tone"})
-        self.assertEqual(agg["criteria"]["total"], 1)
+        agg = _aggregate_criteria(results, self._registry(accuracy, tone))
+        self.assertEqual(set(agg.keys()), {"criteria-passed", "accuracy", "tone"})
+        self.assertEqual(agg["criteria-passed"]["total"], 1)
         self.assertEqual(agg["accuracy"]["total"], 1)
         self.assertEqual(agg["tone"]["total"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Legacy "default" alias in evaluators registry
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluatorsRegistryLegacyDefaultAlias(unittest.TestCase):
+    """Pre-rename, the implicit default evaluator was named ``"default"``.
+    The registry keeps it as an alias so older user configs that reference
+    ``{"name": "default"}`` continue to resolve to the implicit default.
+    """
+
+    def test_default_alias_resolves_to_implicit_default(self):
+        from calibrate.llm.run_tests import _build_evaluators_registry
+        from calibrate.judges import DEFAULT_LLM_TEST_EVALUATOR
+
+        registry = _build_evaluators_registry({})
+        self.assertIn("default", registry)
+        self.assertIs(registry["default"], DEFAULT_LLM_TEST_EVALUATOR)
+        # Canonical name still present.
+        self.assertIn(DEFAULT_LLM_TEST_EVALUATOR["name"], registry)
+
+    def test_user_evaluator_named_default_overrides_alias(self):
+        from calibrate.llm.run_tests import _build_evaluators_registry
+
+        custom = {
+            "name": "default",
+            "system_prompt": "user-defined override",
+            "judge_model": "openai/gpt-4.1",
+        }
+        registry = _build_evaluators_registry({"evaluators": [custom]})
+        # User override wins.
+        self.assertIs(registry["default"], custom)
+
+    def test_default_alias_can_be_referenced_in_test_case(self):
+        """A test case's ``criteria`` referencing ``{"name": "default"}`` must
+        still render successfully and produce the implicit default evaluator."""
+        from calibrate.llm.run_tests import (
+            _build_evaluators_registry,
+            _resolve_evaluators_for_test_case,
+        )
+        from calibrate.judges import DEFAULT_LLM_TEST_EVALUATOR
+
+        registry = _build_evaluators_registry({})
+        evaluation = {
+            "type": "response",
+            "criteria": [{"name": "default", "arguments": {"criteria": "be polite"}}],
+        }
+        rendered = _resolve_evaluators_for_test_case(evaluation, registry)
+        self.assertEqual(len(rendered), 1)
+        # Resolved evaluator carries the canonical name (not the alias).
+        self.assertEqual(rendered[0]["name"], DEFAULT_LLM_TEST_EVALUATOR["name"])
+        self.assertIn("be polite", rendered[0]["system_prompt"])
 
 
 if __name__ == "__main__":

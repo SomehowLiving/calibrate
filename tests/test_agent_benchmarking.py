@@ -107,7 +107,9 @@ class TestRunTestExternalModelParams(unittest.IsolatedAsyncioTestCase):
         ctx, mock_client = _patch_httpx({"response": "Sure, the weather is sunny."})
 
         evaluation = {"type": "response", "criteria": "Agent answers the question"}
-        mock_judge = AsyncMock(return_value={"match": True, "reasoning": "ok"})
+        mock_judge = AsyncMock(
+            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+        )
 
         with ctx, patch("calibrate.llm.run_tests.test_response_llm_judge", mock_judge):
             await run_test_external(
@@ -127,7 +129,9 @@ class TestRunTestExternalModelParams(unittest.IsolatedAsyncioTestCase):
 
         agent = TextAgentConnection(url="http://fake-agent/chat")
         ctx, mock_client = _patch_httpx({"response": "hello"})
-        mock_judge = AsyncMock(return_value={"match": True, "reasoning": "ok"})
+        mock_judge = AsyncMock(
+            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+        )
 
         with ctx, patch("calibrate.llm.run_tests.test_response_llm_judge", mock_judge):
             await run_test_external(
@@ -221,7 +225,9 @@ class TestFolderNaming(unittest.IsolatedAsyncioTestCase):
                 "evaluation": {"type": "response", "criteria": "greet"},
             }
         ]
-        mock_judge = AsyncMock(return_value={"match": True, "reasoning": "ok"})
+        mock_judge = AsyncMock(
+            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ctx, _ = _patch_httpx(fake_body)
@@ -270,7 +276,9 @@ class TestFolderNaming(unittest.IsolatedAsyncioTestCase):
                 "evaluation": {"type": "response", "criteria": "greet"},
             }
         ]
-        mock_judge = AsyncMock(return_value={"match": True, "reasoning": "ok"})
+        mock_judge = AsyncMock(
+            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ctx, _ = _patch_httpx({"response": "hello"})

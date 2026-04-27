@@ -52,40 +52,43 @@ Refer to the [sample dataset](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blo
 
 The evaluation runs providers in parallel (max 2 at a time), showing the transcriptions as they are generated.
 
-## Judge configuration
+## Evaluator configuration
 
-By default, a text LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether each transcription matches the reference text semantically. You can customize the judge model and add multiple evaluation criteria by passing an optional config file with `--config`:
+By default, a text LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether each transcription matches the reference text semantically. You can customize the judge model and add multiple evaluators by passing an optional config file with `--config`:
 
 ```bash
 calibrate stt -p deepgram google -i ./data -o ./out --config config.json
 ```
 
+Each evaluator's `system_prompt` is sent as the system message to its own dedicated LLM judge call (one call per evaluator, run in parallel). The user message contains the source/transcription pair.
+
 The config file supports:
 
 ```json
 {
-  "judge": {
-    "model": "openai/gpt-4.1"
-  },
-  "evaluation_criteria": [
+  "evaluators": [
     {
       "name": "semantic_match",
-      "description": "Check whether the values represented by both strings match semantically."
+      "system_prompt": "You are a highly accurate evaluator. You will be given a source text and a transcription. Mark True if the values represented by both strings match semantically.",
+      "judge_model": "openai/gpt-4.1"
     },
     {
       "name": "completeness",
-      "description": "All information from the source text is present in the transcription."
+      "system_prompt": "You are a highly accurate evaluator. You will be given a source text and a transcription. Mark True if all information from the source text is present in the transcription.",
+      "judge_model": "openai/gpt-4.1"
     }
   ]
 }
 ```
 
-| Key                   | Type   | Description                                                                 |
-| --------------------- | ------ | --------------------------------------------------------------------------- |
-| `judge.model`         | string | OpenRouter model id used by the LLM judge (default: `openai/gpt-4.1`). Use any model in the [OpenRouter catalog](https://openrouter.ai/models). |
-| `evaluation_criteria` | array  | List of criteria to evaluate. Each criterion has `name` and `description`. |
+| Key                       | Type   | Description                                                                  |
+| ------------------------- | ------ | ---------------------------------------------------------------------------- |
+| `evaluators`              | array  | List of evaluators. Each one becomes its own LLM call per row.               |
+| `evaluators[].name`       | string | Unique evaluator name. Becomes the column name in the leaderboard.           |
+| `evaluators[].system_prompt` | string | Full system prompt used for this evaluator's LLM judge call.              |
+| `evaluators[].judge_model` | string | OpenRouter model id for this evaluator (default: `openai/gpt-4.1`). Use any model in the [OpenRouter catalog](https://openrouter.ai/models). |
 
-Each criterion also accepts:
+Each evaluator also accepts:
 
 | Key         | Type    | Description                                                            |
 | ----------- | ------- | ---------------------------------------------------------------------- |
@@ -93,14 +96,14 @@ Each criterion also accepts:
 | `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.              |
 | `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score.             |
 
-Binary criteria produce per-row pass/fail and a mean pass-rate. Rating criteria produce an integer score on your scale and a mean score in the leaderboard.
+Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluators produce an integer score on your scale and a mean score in the leaderboard.
 
-When multiple criteria are defined, each is scored independently and appears as a separate column in the results and leaderboard.
+When multiple evaluators are defined, each is scored independently — one LLM call per evaluator per row, all run in parallel — and appears as a separate column in the results and leaderboard.
 
 Refer to the [sample config](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/stt/config.json) for a template.
 
 <Note>
-  The `--config` flag is optional. When omitted, a single built-in criterion evaluates semantic match between source and transcription.
+  The `--config` flag is optional. When omitted, a single built-in `semantic_match` evaluator scores semantic match between source and transcription.
 </Note>
 
 ## Output

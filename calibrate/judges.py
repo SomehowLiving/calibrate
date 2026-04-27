@@ -1,13 +1,41 @@
 """
 Unified LLM Judge module.
 
-Two judge types:
-- text_judge: evaluates text-based inputs against multiple criteria
-- audio_judge: evaluates audio + reference text against multiple criteria (for TTS)
+An *evaluator* is the unit of grading. It is a dict with the shape::
 
-Both accept a list of evaluation criteria and return per-criterion results.
+    {
+        "name": str,
+        "system_prompt": str,         # may contain {{var}} placeholders
+        "judge_model": str,           # OpenRouter model id
+        "type": "binary" | "rating",  # default: "binary"
+        "scale_min": int,             # only when type == "rating"
+        "scale_max": int,             # only when type == "rating"
+    }
+
+Two judge entry points:
+
+- ``text_judge``  — runs every evaluator in parallel against a text-only
+  user prompt and returns ``{evaluator_name: result}``.
+- ``audio_judge`` — same shape, but also attaches a base64 audio block
+  to each call (used by the TTS pipeline).
+
+Each evaluator becomes one independent LLM call: its ``system_prompt`` is
+sent verbatim as the system message and the per-row context is sent as
+the user message. If multiple evaluators are supplied they are issued
+concurrently; results are stitched back into a single dict keyed by
+``evaluator["name"]``.
+
+Default evaluators are exposed for callers that want to preserve the
+pre-evaluators-API behavior:
+
+- ``DEFAULT_LLM_TEST_EVALUATOR`` (name: ``criteria-passed``)
+- ``DEFAULT_STT_EVALUATOR``      (name: ``semantic_match``)
+- ``DEFAULT_TTS_EVALUATOR``      (name: ``pronunciation``)
+
+Simulation has no implicit default — callers must supply evaluators.
 """
 
+import asyncio
 import base64
 import os
 from typing import Literal, Optional
@@ -35,173 +63,159 @@ def _build_openrouter_client() -> "AsyncOpenAI":
 
 
 # ── Default models (OpenRouter format: <provider>/<model>) ──────────────────
-DEFAULT_TEXT_JUDGE_MODEL = "openai/gpt-4.1"
+DEFAULT_TEXT_JUDGE_MODEL = "openai/gpt-5.4-mini"
 # Simulation uses a stronger model by default for grading multi-turn conversations
-DEFAULT_SIMULATION_JUDGE_MODEL = "openai/gpt-5.2"
-# OpenRouter's audio-capable OpenAI model. Override via judge.model when needed.
-DEFAULT_AUDIO_JUDGE_MODEL = "openai/gpt-4o-audio-preview"
-
-# ── Default criteria per test type ──────────────────────────────────────────
-
-DEFAULT_LLM_TEST_CRITERIA = [
-    {
-        "name": "criteria",
-        "description": "",  # filled in from the test case's criteria string
-    }
-]
-
-DEFAULT_STT_CRITERIA = [
-    {
-        # Default STT criterion — the detailed matching rules live in
-        # STT_JUDGE_SYSTEM_PROMPT, so this description stays short to avoid
-        # redundancy in the final user prompt.
-        "name": "llm_judge",
-        "description": "Does the transcription match the source per the rules above?",
-    }
-]
-
-DEFAULT_TTS_CRITERIA = [
-    {
-        "name": "llm_judge",
-        "description": (
-            "Evaluate if the text is easily understandable from the audio. "
-            "Check whether the spoken words match the reference text and "
-            "the audio is clear enough to convey the intended message."
-        ),
-    }
-]
-
-# ── System prompts (internal, not user-configurable) ────────────────────────
-
-# Generic fallback — used only when a caller doesn't provide a specialized prompt.
-_TEXT_JUDGE_SYSTEM_PROMPT = (
-    "You are a highly accurate evaluator.\n\n"
-    "You will be given some context and a set of evaluation criteria.\n\n"
-    "You need to evaluate the context against each criterion and determine "
-    "whether it passes or fails. Always give your reasoning in English "
-    "irrespective of the language of the content."
-)
-
-# LLM test judge — preserves the pre-refactor framing.
-LLM_TEST_JUDGE_SYSTEM_PROMPT = (
-    "You are a highly accurate evaluator evaluating the response to a "
-    "conversation.\n\n"
-    "You will be given a conversation between a user and a human agent along "
-    "with the response of the human agent to the final user message and an "
-    "evaluation criteria to use for evaluating the agent's final response.\n\n"
-    "You need to evaluate if the response adheres to the evaluation criteria."
-)
-
-# STT judge — preserves the pre-refactor framing (rules live here, not in
-# the criterion description, so default behavior matches what users had before).
-STT_JUDGE_SYSTEM_PROMPT = (
-    "You are a highly accurate evaluator evaluating the transcription output "
-    "of an STT model.\n\n"
-    "You will be given two strings - one is the source string used to produce "
-    "an audio and the other is the transcription of that audio.\n\n"
-    "You need to evaluate if the two strings are the same.\n\n"
-    "# Important Instructions:\n"
-    "- Check whether the values represented by both the strings match. "
-    "E.g. if one string says 1,2,3 but the other string says \"one, two, three\" "
-    "or \"one, 2, three\", they should be considered the same as their "
-    "underlying value is the same. However, if the actual values itself are "
-    "different, e.g. for the name of a person or address or the value of any "
-    "other key detail - that difference should be noted.\n"
-    "- Ignore differences like a word being split up into more than 1 word by "
-    "spaces. Look at whether the values mean the same in both the strings.\n"
-    "- If all the \"values\" for the strings match, mark it as True. Else, False."
-)
-
-_SIMULATION_JUDGE_SYSTEM_PROMPT = (
-    "You are a highly accurate grader.\n\n"
-    "You will be given a conversation between a user and an agent along "
-    "with evaluation criteria to use for evaluating the agent's behaviour."
-    "{agent_instructions_section}\n\n"
-    "You need to evaluate if the agent's behaviour adheres to the evaluation "
-    "criteria. Always give your reasoning in english irrespective of the "
-    "language of the conversation."
-)
-
-# TTS judge — preserves the pre-refactor framing.
-_AUDIO_JUDGE_SYSTEM_PROMPT = (
-    "You are a highly accurate evaluator evaluating the audio output of a "
-    "TTS model.\n\n"
-    "You will be given the audio and the text that should have been spoken "
-    "in the audio.\n\n"
-    "You need to evaluate if the text is easily understandable from the audio."
-)
+DEFAULT_SIMULATION_JUDGE_MODEL = "openai/gpt-5.4-mini"
+# OpenRouter's audio-capable OpenAI model. Override per-evaluator when needed.
+DEFAULT_AUDIO_JUDGE_MODEL = "google/gemini-2.5-flash"
 
 
-# ── Criterion types ─────────────────────────────────────────────────────────
+# ── Evaluator type tags ─────────────────────────────────────────────────────
 
 BINARY = "binary"
 RATING = "rating"
 
 
-def is_rating(criterion: dict) -> bool:
-    """Return True if the criterion is a rating-type criterion."""
-    return criterion.get("type") == RATING
+# ── Default evaluators ──────────────────────────────────────────────────────
+# These are auto-injected by the LLM-test / STT / TTS pipelines when the user
+# does not declare any top-level ``evaluators`` list (or doesn't override the
+# default evaluator's name). Simulation has no implicit default.
+
+DEFAULT_LLM_TEST_EVALUATOR = {
+    "name": "criteria-passed",
+    "system_prompt": (
+        "You are a highly accurate evaluator evaluating the response of an agent to a "
+        "user's message.\n\n"
+        "You will be given a conversation between a user and an agent "
+        "along with the response of the agent to the final user message.\n\n"
+        "You need to evaluate if the response adheres to the evaluation "
+        "criteria:\n\n{{criteria}}"
+    ),
+    "judge_model": DEFAULT_TEXT_JUDGE_MODEL,
+    "type": BINARY,
+}
+
+DEFAULT_STT_EVALUATOR = {
+    "name": "semantic_match",
+    "system_prompt": (
+        "You are a highly accurate evaluator evaluating the transcription "
+        "output of an STT model.\n\n"
+        "You will be given two strings - one is the source string used to "
+        "produce an audio and the other is the transcription of that audio.\n\n"
+        "You need to evaluate if the two strings are the same.\n\n"
+        "# Important Instructions:\n"
+        "- Check whether the values represented by both the strings match. "
+        'E.g. if one string says 1,2,3 but the other string says "one, two, '
+        'three" or "one, 2, three", they should be considered the same as '
+        "their underlying value is the same. However, if the actual values "
+        "itself are different, e.g. for the name of a person or address or "
+        "the value of any other key detail - that difference should be noted.\n"
+        "- Ignore differences like a word being split up into more than 1 "
+        "word by spaces. Look at whether the values mean the same in both "
+        "the strings.\n"
+        "- Minor differences in values of entities (e.g. proper nouns, numbers) matter and should be considered an error.\n"
+        '- If all the "values" for the strings match, mark it as True. Else, '
+        "False."
+    ),
+    "judge_model": DEFAULT_TEXT_JUDGE_MODEL,
+    "type": BINARY,
+}
+
+DEFAULT_TTS_EVALUATOR = {
+    "name": "pronunciation",
+    "system_prompt": (
+        "You are a highly accurate evaluator evaluating the audio output of "
+        "a TTS model.\n\n"
+        "You will be given the audio and the text that should have been "
+        "spoken in the audio.\n\n"
+        "You need to evaluate if the text is easily understandable from the "
+        "audio. Check whether the spoken words match the reference text and "
+        "the audio is clear enough to convey the intended message."
+    ),
+    "judge_model": DEFAULT_AUDIO_JUDGE_MODEL,
+    "type": BINARY,
+}
 
 
-def compat_llm_judge_score(scores: dict) -> Optional[float]:
-    """Compute a 0-1 backward-compatible aggregate from per-criterion ``scores``.
-
-    ``scores`` is the dict produced by ``get_llm_judge_score`` /
-    ``get_tts_llm_judge_score``: ``{criterion_name: {type, mean, scale_min?,
-    scale_max?}}``. For binary criteria the mean is already in 0-1; for rating
-    criteria the mean is rescaled via ``(mean - scale_min) / (scale_max -
-    scale_min)``. The return is the unweighted mean across criteria.
-
-    Used to populate ``metrics.json``'s ``llm_judge_score`` key for legacy
-    UI/report consumers when the user provides custom criterion names.
-    Returns ``None`` if no usable scores were given.
-    """
-    normalized: list[float] = []
-    for score_dict in scores.values():
-        if not isinstance(score_dict, dict) or "mean" not in score_dict:
-            continue
-        mean = float(score_dict["mean"])
-        if score_dict.get("type") == "rating":
-            lo = float(score_dict.get("scale_min", 0))
-            hi = float(score_dict.get("scale_max", 1))
-            rng = hi - lo
-            normalized.append((mean - lo) / rng if rng > 0 else 0.0)
-        else:
-            normalized.append(mean)
-    if not normalized:
-        return None
-    return float(sum(normalized) / len(normalized))
+# ── Type-introspection helpers ──────────────────────────────────────────────
 
 
-def criterion_result_value(criterion: dict, result: dict) -> float:
-    """Extract the numeric value from a per-criterion judge result.
+def is_rating(evaluator: dict) -> bool:
+    """Return True when the evaluator (or per-evaluator score dict) is rating-typed."""
+    return evaluator.get("type") == RATING
 
-    - binary criterion result ``{match: bool, reasoning: str}`` → 0.0 or 1.0
-    - rating criterion result ``{score: int, reasoning: str}`` → the score as float
+
+def evaluator_result_value(evaluator: dict, result: dict) -> float:
+    """Extract the numeric value from a single evaluator's judge result.
+
+    - binary  → ``{"match": bool, "reasoning": str}``  → 0.0 / 1.0
+    - rating  → ``{"score": int,  "reasoning": str}``  → score as float
 
     Used by downstream aggregation (CSV columns, metrics.json means).
     """
-    if is_rating(criterion):
+    if is_rating(evaluator):
         return float(result["score"])
     return float(int(bool(result["match"])))
 
 
-def _rating_range(criterion: dict) -> list[int]:
-    """Return the list of allowed score values for a rating criterion."""
-    lo = int(criterion["scale_min"])
-    hi = int(criterion["scale_max"])
+# Back-compat alias (older imports). Kept to avoid breaking SDK consumers.
+criterion_result_value = evaluator_result_value
+
+
+def format_evaluation_result_lines(eval_row: dict) -> list[str]:
+    """Format a single evaluation_results row as one or two CLI/log lines.
+
+    ``eval_row`` matches the per-evaluator dict written into
+    ``evaluation_results.csv`` (and the simulation ``evaluation_results``
+    list): ``{"name", "type", "value", "reasoning", scale_min?, scale_max?}``.
+
+    Returns a header line plus an indented "Reason:" line when reasoning is
+    present, so callers can ``log_and_print`` each line individually:
+
+        [name] ✅ Pass        # binary, value == 1.0
+        [name] ❌ Fail        # binary, value == 0.0
+        [name] 4/5            # rating
+          Reason: ...
+    """
+    name = eval_row.get("name", "evaluator")
+    ev_type = eval_row.get("type", "binary")
+    value = eval_row.get("value")
+
+    if ev_type == "rating":
+        scale_max = eval_row.get("scale_max")
+        score_str = (
+            f"{int(value)}/{scale_max}" if scale_max is not None else str(value)
+        )
+        header = f"[{name}] {score_str}"
+    else:
+        passed = bool(value)
+        header = f"[{name}] {'✅ Pass' if passed else '❌ Fail'}"
+
+    lines = [header]
+    reasoning = eval_row.get("reasoning")
+    if reasoning:
+        lines.append(f"  Reason: {reasoning}")
+    return lines
+
+
+def _rating_range(evaluator: dict) -> list[int]:
+    """Return the list of allowed score values for a rating evaluator."""
+    lo = int(evaluator["scale_min"])
+    hi = int(evaluator["scale_max"])
     if hi < lo:
         raise ValueError(
-            f"Rating criterion '{criterion.get('name', '?')}' has scale_max ({hi}) "
-            f"less than scale_min ({lo})."
+            f"Rating evaluator '{evaluator.get('name', '?')}' has scale_max "
+            f"({hi}) less than scale_min ({lo})."
         )
     return list(range(lo, hi + 1))
 
 
-# ── Shared Pydantic helpers ─────────────────────────────────────────────────
+# ── Pydantic result models ──────────────────────────────────────────────────
+
 
 class CriterionResult(BaseModel):
-    """Binary result for a single evaluation criterion."""
+    """Binary result for a single evaluator."""
+
     reasoning: str = Field(
         ...,
         description="Step-by-step analysis of whether the criterion is met; be concise.",
@@ -212,15 +226,15 @@ class CriterionResult(BaseModel):
     )
 
 
-def _build_rating_result_model(criterion: dict) -> type[BaseModel]:
-    """Dynamically build a Pydantic model for a rating criterion with a Literal-constrained score."""
-    values = _rating_range(criterion)
+def _build_rating_result_model(evaluator: dict) -> type[BaseModel]:
+    """Dynamically build a Pydantic model for a rating evaluator with a Literal-constrained score."""
+    values = _rating_range(evaluator)
     # Literal[tuple(...)] expands to Literal[1, 2, 3, ...] — safe across Python 3.11+
     ScoreType = Literal[tuple(values)]  # type: ignore[valid-type]
 
-    scale_min = criterion["scale_min"]
-    scale_max = criterion["scale_max"]
-    model_name = f"RatingResult_{criterion.get('name', 'criterion')}"
+    scale_min = evaluator["scale_min"]
+    scale_max = evaluator["scale_max"]
+    model_name = f"RatingResult_{evaluator.get('name', 'evaluator')}"
 
     return create_model(
         model_name,
@@ -240,98 +254,70 @@ def _build_rating_result_model(criterion: dict) -> type[BaseModel]:
                 ...,
                 description=(
                     f"Integer rating score from {scale_min} (lowest) to "
-                    f"{scale_max} (highest) as defined in the criterion description."
+                    f"{scale_max} (highest) as defined in the system prompt."
                 ),
             ),
         ),
     )
 
 
-def _result_model_for_criterion(criterion: dict) -> type[BaseModel]:
-    """Return the Pydantic result model for a single criterion, based on its type."""
-    if is_rating(criterion):
-        return _build_rating_result_model(criterion)
+def _result_model_for_evaluator(evaluator: dict) -> type[BaseModel]:
+    """Return the Pydantic result model for a single evaluator, based on its type."""
+    if is_rating(evaluator):
+        return _build_rating_result_model(evaluator)
     return CriterionResult
 
 
-def build_criteria_output_model(criteria: list[dict]) -> type[BaseModel]:
-    """Create a dynamic Pydantic model with one result field per criterion.
+# ── Evaluator helpers ───────────────────────────────────────────────────────
 
-    Each criterion contributes a field whose shape depends on its ``type``:
-    - binary (default): ``{reasoning: str, match: bool}`` via ``CriterionResult``
-    - rating: ``{reasoning: str, score: Literal[scale_min..scale_max]}``
+
+def render_template(template: str, arguments: dict) -> str:
+    """Substitute ``{{var}}`` placeholders in ``template`` with values from ``arguments``.
+
+    Plain text replacement only — no escaping, conditionals, or loops. Missing
+    placeholders are left intact (so a follow-up render or a self-aware
+    judge LLM can still pick them up).
     """
-    field_definitions: dict[str, tuple[type, ...]] = {}
-    for c in criteria:
-        field_definitions[c["name"]] = (_result_model_for_criterion(c), ...)
-    return create_model("JudgeOutput", **field_definitions)
+    out = template
+    for key, value in (arguments or {}).items():
+        out = out.replace("{{" + key + "}}", str(value))
+    return out
 
 
-def format_criteria_prompt(criteria: list[dict]) -> str:
-    """Format evaluation criteria list into prompt text.
-
-    Rating criteria include a ``(rating N-M)`` hint so the judge LLM knows
-    the score range it must return.
-    """
-    lines = []
-    for c in criteria:
-        if is_rating(c):
-            header = f"**{c['name']}** (rating {c['scale_min']}-{c['scale_max']})"
-        else:
-            header = f"**{c['name']}**"
-        lines.append(f"{header}: {c['description']}")
-    return "\n\n".join(lines)
+def render_evaluator(evaluator: dict, arguments: Optional[dict] = None) -> dict:
+    """Return a copy of ``evaluator`` with its ``system_prompt`` placeholders filled in."""
+    rendered = dict(evaluator)
+    rendered["system_prompt"] = render_template(
+        evaluator.get("system_prompt", ""), arguments or {}
+    )
+    return rendered
 
 
-def normalize_criteria(criteria) -> list[dict]:
-    """Normalize criteria to list[dict] format.
-
-    - string → [{"name": "criteria", "description": "<string>"}]
-    - list[dict] → returned as-is
-    """
-    if isinstance(criteria, str):
-        return [{"name": "criteria", "description": criteria}]
-    return criteria
+def _model_for(evaluator: dict, fallback: str) -> str:
+    """Return the model id for ``evaluator``, falling back when none is set."""
+    return evaluator.get("judge_model") or fallback
 
 
-# ── Text judge ──────────────────────────────────────────────────────────────
+# ── Single-evaluator judge calls ────────────────────────────────────────────
 
-@observe(name="text_judge", capture_input=False)
-async def text_judge(
-    criteria: list[dict],
+
+@observe(name="evaluator_call", capture_input=False)
+async def _judge_one_text(
+    evaluator: dict,
     user_prompt: str,
-    model: str = DEFAULT_TEXT_JUDGE_MODEL,
-    system_prompt: str = None,
+    fallback_model: str,
 ) -> dict:
-    """Multi-criteria text judge — routes through OpenRouter.
-
-    Uses ``instructor`` over Chat Completions (instead of OpenAI's
-    Responses API) because OpenRouter is OpenAI-Chat-Completions
-    compatible but does not implement ``responses.parse``.
-
-    Args:
-        criteria: List of {"name": str, "description": str} dicts.
-        user_prompt: The full user prompt containing the context to evaluate.
-        model: OpenRouter model id (e.g. ``openai/gpt-4.1``).
-        system_prompt: Override for the system prompt (used internally
-            for simulation judge).
-
-    Returns:
-        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
-    """
+    """Issue one chat-completion call for a single text evaluator."""
     client = instructor.apatch(_build_openrouter_client())
-
-    Output = build_criteria_output_model(criteria)
-    _system_prompt = system_prompt or _TEXT_JUDGE_SYSTEM_PROMPT
-
-    criteria_prompt = format_criteria_prompt(criteria)
-    full_user_prompt = f"{user_prompt}\n\n`Evaluation criteria`:\n\n{criteria_prompt}"
+    Output = _result_model_for_evaluator(evaluator)
+    model = _model_for(evaluator, fallback_model)
+    system_prompt = evaluator.get("system_prompt", "")
 
     response = await client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _system_prompt},
-            {"role": "user", "content": full_user_prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         response_model=Output,
         temperature=0,
@@ -343,9 +329,11 @@ async def text_judge(
     if langfuse_enabled and langfuse:
         langfuse.update_current_span(
             metadata={
-                "input": full_user_prompt,
+                "evaluator": evaluator.get("name"),
+                "model": model,
+                "system_prompt": system_prompt,
+                "input": user_prompt,
                 "output": result,
-                "system_prompt": _system_prompt,
                 "output_schema": Output.model_json_schema(),
             }
         )
@@ -353,57 +341,35 @@ async def text_judge(
     return result
 
 
-# ── Audio judge ─────────────────────────────────────────────────────────────
-
-@observe(name="audio_judge", capture_input=False, capture_output=False)
-async def audio_judge(
-    criteria: list[dict],
-    audio_path: str,
+@observe(name="evaluator_call_audio", capture_input=False, capture_output=False)
+async def _judge_one_audio(
+    evaluator: dict,
     reference_text: str,
-    model: str = DEFAULT_AUDIO_JUDGE_MODEL,
+    audio_path: str,
+    audio_b64: str,
+    fallback_model: str,
 ) -> dict:
-    """Multi-criteria audio judge for TTS evaluation — routes through OpenRouter.
-
-    The audio is sent as a base64-encoded ``input_audio`` content block,
-    which OpenRouter forwards to audio-capable upstream models (see
-    https://openrouter.ai/docs/guides/overview/multimodal/audio).
-
-    Args:
-        criteria: List of {"name": str, "description": str} dicts.
-        audio_path: Path to the WAV audio file to evaluate.
-        reference_text: The text that should have been spoken.
-        model: OpenRouter model id of an audio-capable model
-            (default: ``openai/gpt-4o-audio-preview``).
-
-    Returns:
-        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
-    """
+    """Issue one chat-completion call for a single audio evaluator."""
     client = instructor.apatch(_build_openrouter_client())
-
-    Output = build_criteria_output_model(criteria)
-    criteria_prompt = format_criteria_prompt(criteria)
+    Output = _result_model_for_evaluator(evaluator)
+    model = _model_for(evaluator, fallback_model)
+    system_prompt = evaluator.get("system_prompt", "")
 
     response = await client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _AUDIO_JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": (
-                            f"Reference text: {reference_text}\n\n"
-                            f"`Evaluation criteria`:\n\n{criteria_prompt}\n\n"
-                            f"Audio:"
-                        ),
+                        "text": f"Reference text: {reference_text}\n\nAudio:",
                     },
                     {
                         "type": "input_audio",
                         "input_audio": {
-                            "data": base64.b64encode(
-                                open(audio_path, "rb").read()
-                            ).decode("utf-8"),
+                            "data": audio_b64,
                             "format": "wav",
                         },
                     },
@@ -419,46 +385,104 @@ async def audio_judge(
 
     if langfuse_enabled and langfuse:
         from calibrate.langfuse import create_langfuse_audio_media
+
         audio_media = create_langfuse_audio_media(audio_path)
         langfuse.update_current_trace(
             input={"audio": audio_media, "reference_text": reference_text},
             output=result,
             metadata={
+                "evaluator": evaluator.get("name"),
+                "model": model,
+                "system_prompt": system_prompt,
                 "input": f"Reference text: {reference_text}",
                 "output": result,
-                "criteria": criteria,
             },
         )
 
     return result
 
 
-# ── Simulation judge (thin wrapper over text_judge) ─────────────────────────
+# ── Public judge entry points ───────────────────────────────────────────────
 
-@observe(name="simulation_judge")
-async def simulation_judge(
-    conversation: list[dict],
-    evaluation_criteria: list[dict],
-    agent_system_prompt: str = "",
-    model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+
+@observe(name="text_judge", capture_input=False)
+async def text_judge(
+    evaluators: list[dict],
+    user_prompt: str,
+    fallback_model: str = DEFAULT_TEXT_JUDGE_MODEL,
 ) -> dict:
-    """Evaluate a full conversation transcript against multiple criteria.
+    """Run every evaluator in parallel against ``user_prompt``.
 
-    This is a specialization of text_judge for simulation evaluation. It
-    formats the conversation transcript and builds a prompt that includes
-    the agent's system prompt for context.
+    Each evaluator becomes one chat-completion call (system message =
+    ``evaluator["system_prompt"]``, user message = ``user_prompt``). All
+    calls are issued concurrently via ``asyncio.gather``.
 
     Args:
-        conversation: List of message dicts (role/content, may include tool_calls).
-        evaluation_criteria: List of {"name": str, "description": str} dicts.
-        agent_system_prompt: The agent's system prompt (for grading context).
-        model: LLM model to use.
+        evaluators: List of evaluator dicts. ``system_prompt`` should already
+            be rendered (placeholders substituted) by the caller.
+        user_prompt: The per-row context (transcription pair, conversation,
+            etc.) shared across every evaluator call.
+        fallback_model: Model id used when an evaluator has no ``judge_model``.
 
     Returns:
-        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
+        Dict keyed by ``evaluator["name"]``. Binary evaluators give
+        ``{"reasoning": str, "match": bool}``; rating evaluators give
+        ``{"reasoning": str, "score": int}``.
     """
-    # Format conversation including tool calls
-    lines = []
+    if not evaluators:
+        return {}
+
+    coros = [_judge_one_text(ev, user_prompt, fallback_model) for ev in evaluators]
+    results = await asyncio.gather(*coros)
+    return {ev["name"]: r for ev, r in zip(evaluators, results)}
+
+
+@observe(name="audio_judge", capture_input=False, capture_output=False)
+async def audio_judge(
+    evaluators: list[dict],
+    audio_path: str,
+    reference_text: str,
+    fallback_model: str = DEFAULT_AUDIO_JUDGE_MODEL,
+) -> dict:
+    """Run every evaluator in parallel against an audio + reference-text pair.
+
+    Each evaluator gets one chat-completion call carrying the same audio
+    as a base64 ``input_audio`` block (encoded once and reused).
+
+    Args:
+        evaluators: List of evaluator dicts (already rendered).
+        audio_path: Path to the WAV audio file to evaluate.
+        reference_text: The text that should have been spoken.
+        fallback_model: Model id used when an evaluator has no ``judge_model``;
+            should be an audio-capable model.
+
+    Returns:
+        Dict keyed by ``evaluator["name"]``.
+    """
+    if not evaluators:
+        return {}
+
+    audio_b64 = base64.b64encode(open(audio_path, "rb").read()).decode("utf-8")
+
+    coros = [
+        _judge_one_audio(ev, reference_text, audio_path, audio_b64, fallback_model)
+        for ev in evaluators
+    ]
+    results = await asyncio.gather(*coros)
+    return {ev["name"]: r for ev, r in zip(evaluators, results)}
+
+
+# ── Conversation-transcript helper ──────────────────────────────────────────
+
+
+def format_conversation(conversation: list[dict]) -> str:
+    """Format a chat history list into a flat ``role: content`` transcript.
+
+    Tool calls are inlined as ``[Tool Call] name(args)`` lines so the judge
+    LLM can see them alongside textual messages. Used by the simulation and
+    LLM-test runners to build the user prompt that gets passed to text_judge.
+    """
+    lines: list[str] = []
     for msg in conversation:
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -467,33 +491,43 @@ async def simulation_judge(
         if content:
             lines.append(f"{role}: {content}")
 
-        if tool_calls:
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                func_name = func.get("name", "unknown")
-                func_args = func.get("arguments", "{}")
-                lines.append(f"[Tool Call] {func_name}({func_args})")
+        for tc in tool_calls or []:
+            func = tc.get("function", {})
+            func_name = func.get("name", "unknown")
+            func_args = func.get("arguments", "{}")
+            lines.append(f"[Tool Call] {func_name}({func_args})")
 
-    conversation_as_prompt = "\n".join(lines)
+    return "\n".join(lines)
 
-    agent_instructions_section = ""
-    if agent_system_prompt:
-        agent_instructions_section = (
-            f"\n\nThe agent was given the following instructions:\n\n"
-            f"<agent_instructions>\n\n{agent_system_prompt}\n\n</agent_instructions>\n\n"
-            f"Use these instructions to understand what the agent was supposed to do "
-            f"and evaluate if the agent followed its instructions correctly."
-        )
 
-    system_prompt = _SIMULATION_JUDGE_SYSTEM_PROMPT.format(
-        agent_instructions_section=agent_instructions_section
-    )
+# ── Simulation judge (thin wrapper over text_judge) ─────────────────────────
 
-    user_prompt = f"`Chat history`:\n\n{conversation_as_prompt}"
 
+@observe(name="simulation_judge")
+async def simulation_judge(
+    conversation: list[dict],
+    evaluators: list[dict],
+    fallback_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+) -> dict:
+    """Evaluate a conversation transcript against a list of evaluators.
+
+    Simulation has no implicit default evaluator. If ``evaluators`` is empty
+    the function returns ``{}`` and no judge calls are made.
+
+    Args:
+        conversation: List of message dicts (role/content, may include tool_calls).
+        evaluators: List of evaluator dicts (already rendered).
+        fallback_model: Model id used when an evaluator has no ``judge_model``.
+
+    Returns:
+        Dict keyed by ``evaluator["name"]``.
+    """
+    if not evaluators:
+        return {}
+
+    user_prompt = f"`Chat history`:\n\n{format_conversation(conversation)}"
     return await text_judge(
-        criteria=evaluation_criteria,
+        evaluators=evaluators,
         user_prompt=user_prompt,
-        model=model,
-        system_prompt=system_prompt,
+        fallback_model=fallback_model,
     )

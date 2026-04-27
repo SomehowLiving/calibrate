@@ -200,13 +200,6 @@ def _write_leaderboard_workbook(
         )
 
         for run_name, df in run_results.items():
-            # Per-provider sheet historically showed only failing rows by
-            # filtering a boolean `llm_judge_score`. When the user configures
-            # the judge as rating (`type: "rating"` with name `llm_judge`),
-            # the column is numeric and the boolean negation would be wrong,
-            # so fall back to showing all rows in that case.
-            if "llm_judge_score" in df.columns and df["llm_judge_score"].dtype == bool:
-                df = df[~df["llm_judge_score"]]
             sheet_name = _unique_sheet_name(run_name, sheet_names)
             if df.empty:
                 pd.DataFrame({"info": ["No results.csv found"]}).to_excel(

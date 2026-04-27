@@ -1,30 +1,15 @@
 """
 Regression tests for SDK-path judge behavior.
 
-Covers two bugs flagged on PR #47:
-
-1. Simulation SDK (`calibrate.llm.simulations.run`) must write a `type`
-   field into each criterion in `metrics.json`. Without it, the simulation
-   leaderboard's default-binary fallback multiplies rating means by 100
-   (corrupting e.g. `4.2` → `420`).
-
-2. Voice-sim SDK (`calibrate.agent.simulation.run_single`) must fall back
-   to `judge.model` for the STT judge when `judge.stt_model` is omitted,
-   matching the config-driven flow in
-   `calibrate/agent/run_simulation.py::_run_single_simulation_inner`.
-   Otherwise `simulation.run(...)` and `simulation.run_single(...)` can
-   produce different STT scores for the same judge config.
-
 Run with:
     python -m pytest tests/test_sdk_judge_regressions.py -v
 """
 
-import asyncio
 import json
 import os
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
@@ -66,14 +51,19 @@ class TestSDKSimulationMetricsCarryType(unittest.IsolatedAsyncioTestCase):
                 tools=[],
                 personas=[{"characteristics": "friendly", "language": "english"}],
                 scenarios=[{"description": "basic inquiry"}],
-                evaluation_criteria=[
-                    {"name": "tool_usage", "description": "calls tool"},
+                evaluators=[
+                    {
+                        "name": "tool_usage",
+                        "system_prompt": "calls tool",
+                        "judge_model": "openai/gpt-5.2",
+                    },
                     {
                         "name": "fluency",
+                        "system_prompt": "rate fluency",
+                        "judge_model": "openai/gpt-5.2",
                         "type": "rating",
                         "scale_min": 1,
                         "scale_max": 5,
-                        "description": "rate fluency",
                     },
                 ],
                 output_dir=tmp,
@@ -92,66 +82,6 @@ class TestSDKSimulationMetricsCarryType(unittest.IsolatedAsyncioTestCase):
         # Raw means are preserved (no 100x scaling at this stage)
         self.assertAlmostEqual(metrics["fluency"]["mean"], 4.0)
         self.assertAlmostEqual(metrics["tool_usage"]["mean"], 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Bug 2: judge.model falls back to STT judge in agent.simulation.run_single
-# ---------------------------------------------------------------------------
-
-
-class TestAgentSimulationRunSingleSTTFallback(unittest.IsolatedAsyncioTestCase):
-
-    async def _call_run_single(self, judge):
-        """Invoke agent.simulation.run_single with the given judge dict,
-        capturing the kwargs passed to the underlying _run_simulation."""
-        from calibrate.agent import simulation as agent_sim
-
-        captured_kwargs = {}
-
-        async def fake_run_simulation(**kwargs):
-            captured_kwargs.update(kwargs)
-            return {
-                "transcript": [],
-                "evaluation_results": [],
-                "metrics": {},
-                "stt_outputs": [],
-                "tool_calls": [],
-            }
-
-        # Patch the symbol in calibrate.agent.__init__ namespace
-        # (imported locally inside run_single)
-        with patch(
-            "calibrate.agent.run_simulation.run_simulation",
-            side_effect=fake_run_simulation,
-        ):
-            await agent_sim.run_single(
-                system_prompt="You are a user",
-                language="english",
-                gender="female",
-                evaluation_criteria=[{"name": "x", "description": "y"}],
-                output_dir="/tmp/any",
-                judge=judge,
-            )
-        return captured_kwargs
-
-    async def test_judge_model_propagates_to_stt_when_stt_model_missing(self):
-        kwargs = await self._call_run_single({"model": "custom-judge-model"})
-        self.assertEqual(kwargs.get("judge_model"), "custom-judge-model")
-        # Critical: STT judge inherits from judge.model when stt_model is absent
-        self.assertEqual(kwargs.get("stt_judge_model"), "custom-judge-model")
-
-    async def test_explicit_stt_model_overrides_judge_model(self):
-        kwargs = await self._call_run_single({
-            "model": "primary-model",
-            "stt_model": "stt-specific-model",
-        })
-        self.assertEqual(kwargs.get("judge_model"), "primary-model")
-        self.assertEqual(kwargs.get("stt_judge_model"), "stt-specific-model")
-
-    async def test_no_judge_dict_leaves_both_unset(self):
-        kwargs = await self._call_run_single(None)
-        self.assertNotIn("judge_model", kwargs)
-        self.assertNotIn("stt_judge_model", kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -224,54 +154,6 @@ class TestSimulationLeaderboardOverallUnitConsistent(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Bug 4: STT workbook exporter must tolerate numeric llm_judge_score
-# ---------------------------------------------------------------------------
-
-
-class TestSTTLeaderboardWorkbookRatingTolerant(unittest.TestCase):
-
-    def test_numeric_llm_judge_score_does_not_break_workbook(self):
-        """When a user renames their rating criterion to `llm_judge`,
-        results.csv's llm_judge_score column is numeric. The STT leaderboard
-        workbook exporter used to do `df = df[~df["llm_judge_score"]]`
-        which is bitwise-NOT on ints — producing garbage or errors.
-        The fix skips the boolean-negation filter for non-boolean columns.
-        """
-        import pathlib
-        import pandas as pd
-        from calibrate.stt.leaderboard import generate_leaderboard
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base = pathlib.Path(tmp)
-            provider = base / "deepgram"
-            provider.mkdir()
-            (provider / "metrics.json").write_text(
-                json.dumps({
-                    "wer": 0.1,
-                    "string_similarity": 0.9,
-                    "llm_judge_score": 4.2,  # rating mean, not bool
-                })
-            )
-            # results.csv with numeric llm_judge_score (rating scores 3-5)
-            pd.DataFrame([
-                {"id": 1, "gt": "hi", "pred": "hi", "llm_judge_score": 5},
-                {"id": 2, "gt": "bye", "pred": "by", "llm_judge_score": 3},
-                {"id": 3, "gt": "ok", "pred": "ok", "llm_judge_score": 5},
-            ]).to_csv(provider / "results.csv", index=False)
-
-            # Should not raise; should produce a valid workbook
-            generate_leaderboard(str(base))
-
-            xlsx = base / "leaderboard" / "stt_leaderboard.xlsx"
-            self.assertTrue(xlsx.exists())
-
-            # All 3 rows should appear in the per-provider sheet
-            # (filter is skipped because column is numeric)
-            provider_sheet = pd.read_excel(xlsx, sheet_name="deepgram")
-            self.assertEqual(len(provider_sheet), 3)
-
-
-# ---------------------------------------------------------------------------
 # Bug 5: simulation metrics.json must persist scale_min/scale_max for rating
 # ---------------------------------------------------------------------------
 
@@ -315,12 +197,13 @@ class TestSimulationMetricsPersistScaleBounds(unittest.IsolatedAsyncioTestCase):
                 tools=[],
                 personas=[{"characteristics": "x", "language": "english"}],
                 scenarios=[{"description": "x"}],
-                evaluation_criteria=[{
+                evaluators=[{
                     "name": "fluency",
+                    "system_prompt": "rate fluency",
+                    "judge_model": "openai/gpt-5.2",
                     "type": "rating",
                     "scale_min": 1,
                     "scale_max": 5,
-                    "description": "rate fluency",
                 }],
                 output_dir=tmp,
                 model="gpt-4.1",
@@ -441,138 +324,6 @@ class TestSimulationLeaderboardChartNormalizesRating(unittest.TestCase):
             chart_path = save_dir / "simulation_leaderboard.png"
             self.assertTrue(chart_path.exists())
             self.assertGreater(chart_path.stat().st_size, 1000)
-
-
-# ---------------------------------------------------------------------------
-# Bug 8: STT/TTS metrics.json must keep llm_judge_score for legacy consumers
-# ---------------------------------------------------------------------------
-
-
-class TestCompatLLMJudgeScoreHelper(unittest.TestCase):
-    """Pure-function helper used by both STT and TTS to compute the
-    backward-compat `llm_judge_score` aggregate."""
-
-    def test_default_single_binary_criterion_passes_through(self):
-        from calibrate.judges import compat_llm_judge_score
-
-        scores = {"llm_judge": {"type": "binary", "mean": 0.85}}
-        self.assertAlmostEqual(compat_llm_judge_score(scores), 0.85)
-
-    def test_multi_binary_means_averaged(self):
-        from calibrate.judges import compat_llm_judge_score
-
-        scores = {
-            "semantic_match": {"type": "binary", "mean": 1.0},
-            "completeness": {"type": "binary", "mean": 0.5},
-        }
-        self.assertAlmostEqual(compat_llm_judge_score(scores), 0.75)
-
-    def test_rating_criterion_normalized_to_0_1(self):
-        from calibrate.judges import compat_llm_judge_score
-
-        scores = {
-            "fluency": {
-                "type": "rating",
-                "mean": 4.0,
-                "scale_min": 1,
-                "scale_max": 5,
-            }
-        }
-        # (4 - 1) / (5 - 1) = 0.75
-        self.assertAlmostEqual(compat_llm_judge_score(scores), 0.75)
-
-    def test_mixed_binary_and_rating(self):
-        from calibrate.judges import compat_llm_judge_score
-
-        scores = {
-            "accuracy": {"type": "binary", "mean": 1.0},
-            "fluency": {
-                "type": "rating",
-                "mean": 1.0,  # min of scale → 0 normalized
-                "scale_min": 1,
-                "scale_max": 5,
-            },
-        }
-        # mean(1.0, 0.0) = 0.5
-        self.assertAlmostEqual(compat_llm_judge_score(scores), 0.5)
-
-    def test_empty_scores_returns_none(self):
-        from calibrate.judges import compat_llm_judge_score
-
-        self.assertIsNone(compat_llm_judge_score({}))
-
-
-class TestSTTEvalBackwardCompatLLMJudgeScore(unittest.IsolatedAsyncioTestCase):
-    """End-to-end: STT eval with custom criterion names must still emit
-    `llm_judge_score` so the Ink UI's existing consumers don't break."""
-
-    async def test_metrics_json_has_llm_judge_score_with_custom_criterion(self):
-        from calibrate.stt import eval as stt_eval
-
-        # Mock get_llm_judge_score to return scores under custom names only
-        async def fake_judge_score(*args, **kwargs):
-            return {
-                "criteria_names": ["semantic_match"],
-                "scores": {
-                    "semantic_match": {"type": "binary", "mean": 0.75},
-                },
-                "score": 0.75,
-                "per_row": [{"semantic_match": {"match": True, "reasoning": "ok"}}],
-            }
-
-        # Mock the STT inference and metric helpers used inside run_single_provider_eval
-        async def fake_run_stt_eval(**kwargs):
-            return 1  # success_count
-
-        def fake_validate_input_dir(*args, **kwargs):
-            return True, None
-
-        def fake_wer(refs, preds):
-            return {"score": 0.1, "per_row": [0.1]}
-
-        def fake_sim(refs, preds):
-            return {"score": 0.9, "per_row": [0.9]}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            input_dir = os.path.join(tmp, "data")
-            os.makedirs(os.path.join(input_dir, "audios"))
-            # Write the input CSV
-            with open(os.path.join(input_dir, "stt.csv"), "w") as f:
-                f.write("id,text\nx1,hello world\n")
-            # Pre-seed the per-provider results.csv that run_stt_eval would create
-            provider_dir = os.path.join(tmp, "out", "deepgram")
-            os.makedirs(provider_dir)
-            with open(os.path.join(provider_dir, "results.csv"), "w") as f:
-                f.write("id,gt,pred\nx1,hello world,hello world\n")
-
-            with patch.object(stt_eval, "run_stt_eval", side_effect=fake_run_stt_eval), \
-                 patch.object(stt_eval, "validate_stt_input_dir", side_effect=fake_validate_input_dir), \
-                 patch.object(stt_eval, "get_wer_score", side_effect=fake_wer), \
-                 patch.object(stt_eval, "get_string_similarity", side_effect=fake_sim), \
-                 patch.object(stt_eval, "get_llm_judge_score", side_effect=fake_judge_score):
-                await stt_eval.run_single_provider_eval(
-                    provider="deepgram",
-                    language="english",
-                    input_dir=input_dir,
-                    input_file_name="stt.csv",
-                    output_dir=os.path.join(tmp, "out"),
-                    debug=False,
-                    debug_count=5,
-                    ignore_retry=True,  # skip retry loop
-                    overwrite=False,
-                    judge_criteria=[
-                        {"name": "semantic_match", "description": "values match"}
-                    ],
-                )
-
-            with open(os.path.join(provider_dir, "metrics.json")) as f:
-                metrics = json.load(f)
-
-        # Custom criterion column is present
-        self.assertIn("semantic_match_score", metrics)
-        # Backward-compat aggregate also present
-        self.assertIn("llm_judge_score", metrics)
-        self.assertAlmostEqual(metrics["llm_judge_score"], 0.75)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,13 @@ def _make_mock_openai_client(content="I need help with my order."):
 # ---------------------------------------------------------------------------
 
 
+_HELPFULNESS_EVALUATOR = {
+    "name": "helpfulness",
+    "system_prompt": "Evaluate whether the agent was helpful.",
+    "judge_model": "openai/gpt-5.2",
+}
+
+
 def _make_config(agent_url, max_turns=2, agent_speaks_first=True, num_personas=1, num_scenarios=1):
     personas = [
         {"label": f"p{i+1}", "characteristics": "friendly", "gender": "neutral", "language": "english"}
@@ -67,7 +74,7 @@ def _make_config(agent_url, max_turns=2, agent_speaks_first=True, num_personas=1
         "agent_url": agent_url,
         "personas": personas,
         "scenarios": scenarios,
-        "evaluation_criteria": [{"name": "helpfulness", "description": "Was the agent helpful?"}],
+        "evaluators": [_HELPFULNESS_EVALUATOR],
         "settings": {"agent_speaks_first": agent_speaks_first, "max_turns": max_turns},
     }
 
@@ -115,7 +122,7 @@ class TestRunSimulationWithAgent:
                 return await run_simulation_with_agent(
                     agent=agent,
                     user_system_prompt="You are a friendly user.",
-                    evaluation_criteria=[{"name": "helpfulness", "description": "Was the agent helpful?"}],
+                    evaluators=[_HELPFULNESS_EVALUATOR],
                     agent_speaks_first=agent_speaks_first,
                     max_turns=max_turns,
                     user_model="gpt-4.1",
@@ -174,15 +181,15 @@ class TestRunSimulationWithAgent:
             f"Expected 3 requests (1 initial + 2 turns), got {num_requests}"
         )
 
-    def test_evaluate_called_with_transcript_and_criteria(self, agent_server):
-        """evaluate_simuation mock called once with the transcript and criteria list."""
+    def test_evaluate_called_with_transcript_and_evaluators(self, agent_server):
+        """evaluate_simuation mock called once with the transcript and evaluators list."""
         from calibrate.llm.run_simulation import run_simulation_with_agent
         from calibrate.connections import TextAgentConnection
 
         agent = TextAgentConnection(url=agent_server.url_for("/chat"))
         MockAsyncOpenAI = _make_mock_openai_client()
         eval_mock = AsyncMock(return_value=FAKE_EVAL_RESULT)
-        criteria = [{"name": "helpfulness", "description": "Was the agent helpful?"}]
+        evaluators = [_HELPFULNESS_EVALUATOR]
 
         async def _inner():
             with patch("openai.AsyncOpenAI", MockAsyncOpenAI), \
@@ -190,7 +197,7 @@ class TestRunSimulationWithAgent:
                 return await run_simulation_with_agent(
                     agent=agent,
                     user_system_prompt="You are a friendly user.",
-                    evaluation_criteria=criteria,
+                    evaluators=evaluators,
                     agent_speaks_first=True,
                     max_turns=2,
                 )
@@ -200,9 +207,9 @@ class TestRunSimulationWithAgent:
         eval_mock.assert_called_once()
         call_args = eval_mock.call_args
         transcript_arg = call_args[0][0]
-        criteria_arg = call_args[0][1]
+        evaluators_arg = call_args[0][1]
         assert isinstance(transcript_arg, list), "First arg to evaluate_simuation should be a list"
-        assert criteria_arg == criteria, "Second arg should be criteria list"
+        assert evaluators_arg == evaluators, "Second arg should be evaluators list"
 
     def test_returns_transcript_and_evaluation_results(self, agent_server):
         """Return dict has 'transcript' and 'evaluation_results' keys with correct content."""
@@ -497,7 +504,7 @@ class TestAgentConnectionDetection:
         config = {
             "personas": [{"label": "p1", "characteristics": "friendly", "gender": "neutral", "language": "english"}],
             "scenarios": [{"name": "s1", "description": "ask about order"}],
-            "evaluation_criteria": [{"name": "helpfulness", "description": "Was the agent helpful?"}],
+            "evaluators": [_HELPFULNESS_EVALUATOR],
             "settings": {"agent_speaks_first": True, "max_turns": 2},
             # no agent_url key
         }
@@ -516,7 +523,7 @@ class TestAgentConnectionDetection:
             "agent_url": httpserver.url_for("/chat"),
             "personas": [{"label": "p1", "characteristics": "friendly", "gender": "neutral", "language": "english"}],
             "scenarios": [{"name": "s1", "description": "ask about order"}],
-            "evaluation_criteria": [{"name": "helpfulness", "description": "Was the agent helpful?"}],
+            "evaluators": [_HELPFULNESS_EVALUATOR],
             "settings": {"agent_speaks_first": True, "max_turns": 2},
         }
         agents = self._run_main_capturing_agent(config, tmp_path)

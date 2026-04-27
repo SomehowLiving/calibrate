@@ -80,37 +80,46 @@ An array of scenarios that define different conversation patterns to test. For a
 }
 ```
 
-## Evaluation criteria
+## Evaluators
 
-An array of LLM judges used to evaluate the agent's performance. Each LLM judge has:
+An array of LLM judges used to evaluate the agent's performance. Each evaluator becomes its own LLM call per simulation — all evaluators run in parallel against the same conversation transcript.
 
-| Key           | Type    | Description                                                    |
-| ------------- | ------- | -------------------------------------------------------------- |
-| `name`        | string  | A short name (used in results and leaderboard columns)         |
-| `description` | string  | Instructions on how to measure it (used by the LLM judge)      |
-| `type`        | string  | `"binary"` (default) or `"rating"`                             |
-| `scale_min`   | integer | Required when `type` is `"rating"`. Lowest allowed score.      |
-| `scale_max`   | integer | Required when `type` is `"rating"`. Highest allowed score.     |
+<Note>
+  Simulations have **no implicit defaults**. You must define every evaluator
+  yourself, including all of the context (such as the agent's role) that the
+  judge needs in its `system_prompt`.
+</Note>
+
+| Key             | Type    | Description                                                                                                          |
+| --------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `name`          | string  | A short name (used in results and leaderboard columns)                                                               |
+| `system_prompt` | string  | Full system prompt for this evaluator's LLM judge call. Include any agent-context the judge needs to score correctly. |
+| `judge_model`   | string  | OpenRouter model id for this evaluator (default: `openai/gpt-5.2`)                                                  |
+| `type`          | string  | `"binary"` (default) or `"rating"`                                                                                  |
+| `scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                                           |
+| `scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                                          |
 
 ```json
 {
-  "evaluation_criteria": [
+  "evaluators": [
     {
       "name": "tool_usage",
-      "description": "The agent should call the log_inquiry tool with the correct inquiry_type and order_id when provided by the customer."
+      "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a customer support assistant for an online store) and a simulated user. You will be given the chat history of the conversation. Mark True if the agent called the `log_inquiry` tool with the correct `inquiry_type` and `order_id` whenever the customer provided one.",
+      "judge_model": "openai/gpt-5.2"
     },
     {
       "name": "helpfulness",
+      "system_prompt": "You are a highly accurate evaluator assessing a conversation between a customer support agent and a simulated user. You will be given the chat history of the conversation. Rate the agent's helpfulness on a 1-5 scale: 1 (unhelpful, confused), 3 (somewhat helpful), 5 (clearly resolved the customer's need).",
+      "judge_model": "openai/gpt-5.2",
       "type": "rating",
       "scale_min": 1,
-      "scale_max": 5,
-      "description": "Rate helpfulness 1 (unhelpful, confused) to 5 (clearly resolved the customer's need)."
+      "scale_max": 5
     }
   ]
 }
 ```
 
-Binary criteria produce pass/fail and appear as pass-rate percentages in the leaderboard. Rating criteria produce an integer score on the scale you define and appear as mean scores in the leaderboard.
+Binary evaluators produce pass/fail and appear as pass-rate percentages in the leaderboard. Rating evaluators produce an integer score on the scale you define and appear as mean scores in the leaderboard.
 
 ## Settings
 
@@ -129,27 +138,6 @@ Optional settings to control the simulation:
   }
 }
 ```
-
-## Judge configuration
-
-By default, the evaluation criteria are scored by a text LLM judge that routes through [OpenRouter](https://openrouter.ai/) — set `OPENROUTER_API_KEY` in your environment. You can override the judge model via an optional top-level `judge` key:
-
-| Key         | Type   | Description                                                                                          |
-| ----------- | ------ | ---------------------------------------------------------------------------------------------------- |
-| `model`     | string | OpenRouter model id for the evaluation judge (default: `openai/gpt-5.2`)                            |
-| `stt_model` | string | OpenRouter model id for the STT judge in voice simulations (default: `openai/gpt-4.1`, falls back to `model`) |
-
-```json
-{
-  "judge": {
-    "model": "openai/gpt-5.2"
-  }
-}
-```
-
-<Note>
-  The `judge` key is optional. When omitted, the built-in defaults are used.
-</Note>
 
 ## STT, LLM, and TTS (voice simulations only)
 
@@ -194,10 +182,11 @@ For voice simulations, specify the STT, LLM, and TTS providers:
           "description": "Ask about your order status directly and provide your order ID right away."
         }
       ],
-      "evaluation_criteria": [
+      "evaluators": [
         {
           "name": "tool_usage",
-          "description": "The agent should call the log_inquiry tool with the correct inquiry_type and order_id when provided by the customer."
+          "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a customer support assistant for an online store) and a simulated user. You will be given the chat history of the conversation. Mark True if the agent called the `log_inquiry` tool with the correct `inquiry_type` and `order_id` whenever the customer provided one.",
+          "judge_model": "openai/gpt-5.2"
         }
       ],
       "settings": {
@@ -232,10 +221,11 @@ For voice simulations, specify the STT, LLM, and TTS providers:
           "description": "Ask about your order status directly and provide your order ID right away."
         }
       ],
-      "evaluation_criteria": [
+      "evaluators": [
         {
           "name": "order_resolved",
-          "description": "The agent should look up and clearly communicate the order status to the customer."
+          "system_prompt": "You are a highly accurate evaluator assessing a conversation between a customer support agent and a simulated user. You will be given the chat history of the conversation. Mark True if the agent looked up and clearly communicated the order status to the customer.",
+          "judge_model": "openai/gpt-4.1"
         }
       ],
       "settings": {

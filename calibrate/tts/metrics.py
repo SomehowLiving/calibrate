@@ -11,14 +11,19 @@ import backoff
 from calibrate.judges import (
     audio_judge,
     is_rating,
-    criterion_result_value,
+    evaluator_result_value,
     DEFAULT_AUDIO_JUDGE_MODEL,
-    DEFAULT_TTS_CRITERIA,
+    DEFAULT_TTS_EVALUATOR,
 )
 from calibrate.langfuse import observe
 
 # Re-export for existing imports
 DEFAULT_TTS_JUDGE_MODEL = DEFAULT_AUDIO_JUDGE_MODEL
+
+
+def _resolve_evaluators(evaluators: Optional[List[dict]]) -> List[dict]:
+    """Return ``evaluators`` if non-empty, else the implicit default."""
+    return list(evaluators) if evaluators else [DEFAULT_TTS_EVALUATOR]
 
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5, factor=2)
@@ -30,75 +35,83 @@ DEFAULT_TTS_JUDGE_MODEL = DEFAULT_AUDIO_JUDGE_MODEL
 async def tts_llm_judge(
     audio_path: str,
     reference_text: str,
-    model: str = DEFAULT_TTS_JUDGE_MODEL,
-    criteria: Optional[List[dict]] = None,
+    evaluators: Optional[List[dict]] = None,
+    fallback_model: str = DEFAULT_TTS_JUDGE_MODEL,
 ) -> dict:
-    """Evaluate a TTS audio output against one or more criteria.
+    """Evaluate a TTS audio output against one or more evaluators.
 
     Args:
         audio_path: Path to the synthesized WAV audio file.
         reference_text: The text that should have been spoken.
-        model: Judge model to use (must be audio-capable).
-        criteria: List of {"name", "description"} dicts. Defaults to DEFAULT_TTS_CRITERIA.
+        evaluators: List of evaluator dicts. If omitted, the implicit
+            ``DEFAULT_TTS_EVALUATOR`` is used.
+        fallback_model: Audio-capable model id used when an evaluator
+            lacks ``judge_model``.
 
     Returns:
-        Dict keyed by criterion name, each value {"reasoning": str, "match": bool}.
+        Dict keyed by evaluator name. Binary entries are
+        ``{"reasoning": str, "match": bool}``; rating entries are
+        ``{"reasoning": str, "score": int}``.
     """
-    criteria_list = criteria if criteria else DEFAULT_TTS_CRITERIA
+    evaluators = _resolve_evaluators(evaluators)
 
     return await audio_judge(
-        criteria=criteria_list,
+        evaluators=evaluators,
         audio_path=audio_path,
         reference_text=reference_text,
-        model=model,
+        fallback_model=fallback_model,
     )
 
 
 async def get_tts_llm_judge_score(
     audio_paths: List[str],
     reference_texts: List[str],
-    model: str = DEFAULT_TTS_JUDGE_MODEL,
-    criteria: Optional[List[dict]] = None,
+    evaluators: Optional[List[dict]] = None,
+    fallback_model: str = DEFAULT_TTS_JUDGE_MODEL,
 ) -> dict:
-    """Run TTS judge across all rows and aggregate per-criterion scores.
+    """Run TTS judge across all rows and aggregate per-evaluator scores.
 
     Returns:
         {
-            "criteria_names": ["llm_judge", ...],
-            "scores": {"llm_judge": float, ...},
-            "score": float,  # overall mean (backward compat)
+            "scores": {"pronunciation": {"type": "binary", "mean": 0.83}, ...},
+            "score": float,
             "per_row": [
-                {"llm_judge": {"reasoning": ..., "match": ...}, ...},
+                {"pronunciation": {"reasoning": ..., "match": ...}, ...},
                 ...
             ]
         }
-    """
-    criteria_list = criteria if criteria else DEFAULT_TTS_CRITERIA
 
-    coroutines = []
-    for audio_path, reference_text in zip(audio_paths, reference_texts):
-        coroutines.append(
-            tts_llm_judge(audio_path, reference_text, model=model, criteria=criteria_list)
+    Iteration order of ``scores`` and each ``per_row`` entry matches the
+    order of the ``evaluators`` argument.
+    """
+    evaluators = _resolve_evaluators(evaluators)
+
+    coroutines = [
+        tts_llm_judge(
+            audio_path,
+            reference_text,
+            evaluators=evaluators,
+            fallback_model=fallback_model,
         )
+        for audio_path, reference_text in zip(audio_paths, reference_texts)
+    ]
 
     results = await tqdm_asyncio.gather(
         *coroutines,
-        desc="Running TTS LLM Judge",
+        desc="Running TTS evaluators",
     )
 
-    criteria_names = [c["name"] for c in criteria_list]
-
-    # Aggregate per-criterion scores — binary: mean 0/1, rating: mean score
+    # Aggregate per-evaluator scores — binary: mean 0/1, rating: mean score
     scores: dict = {}
-    for c in criteria_list:
-        name = c["name"]
-        per_row_values = [criterion_result_value(c, row[name]) for row in results]
-        if is_rating(c):
+    for ev in evaluators:
+        name = ev["name"]
+        per_row_values = [evaluator_result_value(ev, row[name]) for row in results]
+        if is_rating(ev):
             scores[name] = {
                 "type": "rating",
                 "mean": float(np.mean(per_row_values)),
-                "scale_min": int(c["scale_min"]),
-                "scale_max": int(c["scale_max"]),
+                "scale_min": int(ev["scale_min"]),
+                "scale_max": int(ev["scale_max"]),
             }
         else:
             scores[name] = {
@@ -109,7 +122,6 @@ async def get_tts_llm_judge_score(
     overall_score = float(np.mean([s["mean"] for s in scores.values()]))
 
     return {
-        "criteria_names": criteria_names,
         "scores": scores,
         "score": overall_score,
         "per_row": results,

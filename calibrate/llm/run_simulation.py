@@ -47,10 +47,14 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 from calibrate.llm.metrics import evaluate_simuation, DEFAULT_SIMULATION_JUDGE_MODEL
-from calibrate.judges import criterion_result_value, is_rating
+from calibrate.judges import (
+    evaluator_result_value,
+    format_evaluation_result_lines,
+    is_rating,
+)
 
 
-def _build_evaluation_result(criterion: dict, judge_row: dict) -> dict:
+def _build_evaluation_result(evaluator: dict, judge_row: dict) -> dict:
     """Build a per-row evaluation result, carrying rating scale bounds when relevant.
 
     The scale bounds propagate through to ``metrics.json`` so the simulation
@@ -58,14 +62,14 @@ def _build_evaluation_result(criterion: dict, judge_row: dict) -> dict:
     ``overall`` column.
     """
     result = {
-        "name": criterion["name"],
-        "type": "rating" if is_rating(criterion) else "binary",
-        "value": criterion_result_value(criterion, judge_row),
+        "name": evaluator["name"],
+        "type": "rating" if is_rating(evaluator) else "binary",
+        "value": evaluator_result_value(evaluator, judge_row),
         "reasoning": judge_row["reasoning"],
     }
-    if is_rating(criterion):
-        result["scale_min"] = int(criterion["scale_min"])
-        result["scale_max"] = int(criterion["scale_max"])
+    if is_rating(evaluator):
+        result["scale_min"] = int(evaluator["scale_min"])
+        result["scale_max"] = int(evaluator["scale_max"])
     return result
 import pandas as pd
 import numpy as np
@@ -270,7 +274,7 @@ async def run_simulation(
     bot_system_prompt: str,
     tools: List[dict],
     user_system_prompt: str,
-    evaluation_criteria: list[dict],
+    evaluators: list[dict],
     bot_model: str = "gpt-4.1",
     user_model: str = "gpt-4.1",
     bot_provider: str = "openai",
@@ -278,7 +282,7 @@ async def run_simulation(
     agent_speaks_first: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     output_dir: Optional[str] = None,
-    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+    fallback_judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
 ) -> List[str]:
     """Runs a text-only bot that processes text inputs through an LLM and returns text outputs."""
     # Create LLM service
@@ -516,16 +520,20 @@ async def run_simulation(
         )
 
     log_and_print(
-        f"Evaluating the conversation based on the criteria:\n\n{evaluation_criteria}"
+        f"Evaluating the conversation against {len(evaluators)} evaluator(s)."
     )
     llm_judge_result = await evaluate_simuation(
-        transcript, evaluation_criteria, agent_system_prompt=bot_system_prompt, model=judge_model
+        transcript, evaluators, fallback_model=fallback_judge_model
     )
 
     evaluation_results = [
-        _build_evaluation_result(criterion, llm_judge_result[criterion["name"]])
-        for criterion in evaluation_criteria
+        _build_evaluation_result(ev, llm_judge_result[ev["name"]])
+        for ev in evaluators
     ]
+
+    for row in evaluation_results:
+        for line in format_evaluation_result_lines(row):
+            log_and_print(line)
 
     return {
         "transcript": transcript,
@@ -545,13 +553,13 @@ def _save_transcript(output_dir: str | None, transcript: list[dict]) -> None:
 async def run_simulation_with_agent(
     agent: "TextAgentConnection",
     user_system_prompt: str,
-    evaluation_criteria: list[dict],
+    evaluators: list[dict],
     agent_speaks_first: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     user_model: str = "gpt-4.1",
     user_provider: str = "openai",
     output_dir: Optional[str] = None,
-    judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+    fallback_judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
 ) -> dict:
     """Run a text simulation where the agent is an external HTTP endpoint.
 
@@ -562,7 +570,7 @@ async def run_simulation_with_agent(
     Args:
         agent: External agent connection.
         user_system_prompt: System prompt for the simulated user.
-        evaluation_criteria: List of criteria dicts with ``name`` and ``description``.
+        evaluators: List of evaluator dicts with ``name`` and ``system_prompt``.
         agent_speaks_first: Whether the agent sends the first message. Default: True.
         max_turns: Maximum agent turns before ending. Default: 50.
         user_model: Model for the user simulator. Default: ``gpt-4.1``.
@@ -660,14 +668,20 @@ async def run_simulation_with_agent(
     _save_transcript(output_dir, transcript)
 
     log_and_print(
-        f"Evaluating the conversation based on the criteria:\n\n{evaluation_criteria}"
+        f"Evaluating the conversation against {len(evaluators)} evaluator(s)."
     )
-    llm_judge_result = await evaluate_simuation(transcript, evaluation_criteria, model=judge_model)
+    llm_judge_result = await evaluate_simuation(
+        transcript, evaluators, fallback_model=fallback_judge_model
+    )
 
     evaluation_results = [
-        _build_evaluation_result(criterion, llm_judge_result[criterion["name"]])
-        for criterion in evaluation_criteria
+        _build_evaluation_result(ev, llm_judge_result[ev["name"]])
+        for ev in evaluators
     ]
+
+    for row in evaluation_results:
+        for line in format_evaluation_result_lines(row):
+            log_and_print(line)
 
     return {
         "transcript": transcript,
@@ -749,14 +763,14 @@ async def run_single_simulation_task(
             log_and_print(f"\033[93mAgent Speaks First:\033[0m {agent_speaks_first}")
             log_and_print("--------------------------------")
 
-            judge_model = config.get("judge", {}).get("model", DEFAULT_SIMULATION_JUDGE_MODEL)
+            evaluators = config.get("evaluators") or []
 
             try:
                 if agent is not None:
                     output = await run_simulation_with_agent(
                         agent=agent,
                         user_system_prompt=user_system_prompt,
-                        evaluation_criteria=config["evaluation_criteria"],
+                        evaluators=evaluators,
                         agent_speaks_first=agent_speaks_first,
                         max_turns=config.get("settings", {}).get(
                             "max_turns", DEFAULT_MAX_TURNS
@@ -764,7 +778,6 @@ async def run_single_simulation_task(
                         user_model="gpt-4.1",
                         user_provider="openai",
                         output_dir=simulation_output_dir,
-                        judge_model=judge_model,
                     )
                 else:
                     output = await run_simulation(
@@ -772,7 +785,7 @@ async def run_single_simulation_task(
                         + f"\n\nYou must always speak in {language}.",
                         tools=config["tools"],
                         user_system_prompt=user_system_prompt,
-                        evaluation_criteria=config["evaluation_criteria"],
+                        evaluators=evaluators,
                         bot_model=args.model,
                         user_model="gpt-4.1",
                         bot_provider=args.provider,
@@ -782,7 +795,6 @@ async def run_single_simulation_task(
                             "max_turns", DEFAULT_MAX_TURNS
                         ),
                         output_dir=simulation_output_dir,
-                        judge_model=judge_model,
                     )
 
                 simulation_metrics = {
