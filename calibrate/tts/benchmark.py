@@ -270,7 +270,13 @@ async def main():
                     has_errors = True
                 else:
                     metrics = provider_result.get("metrics", {})
-                    judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+                    # Evaluator entries are dicts carrying a ``type`` field;
+                    # ttfb has no ``type`` so it's correctly excluded.
+                    judge_scores = {
+                        k: v["mean"]
+                        for k, v in metrics.items()
+                        if isinstance(v, dict) and "type" in v
+                    }
                     ttfb_data = metrics.get("ttfb", {})
                     ttfb_mean = ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"
                     judge_str = ", ".join(f"{k}={v:.2f}" for k, v in judge_scores.items())

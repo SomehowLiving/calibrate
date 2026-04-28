@@ -148,12 +148,10 @@ class _Tests:
                     evaluators=resolved_evaluators,
                 )
             else:
-                agent_language = test_case.get("settings", {}).get("language", "english")
                 result = await _run_test(
                     chat_history=test_case["history"],
                     evaluation=evaluation,
-                    system_prompt=system_prompt
-                    + f"\n\nYou must always speak in {agent_language}.",
+                    system_prompt=system_prompt,
                     model=model,
                     provider=provider,
                     tools=tools,
@@ -240,7 +238,7 @@ class _Tests:
         ``agent`` is provided).
 
         Args:
-            test_cases: List of test case dicts, each containing 'history', 'evaluation', and optional 'settings'
+            test_cases: List of test case dicts, each containing 'history' and 'evaluation'
             system_prompt: System prompt for the LLM (ignored when agent is provided)
             tools: List of tool definitions available to the LLM (ignored when agent is provided)
             output_dir: Path to output directory for results (default: ./out)

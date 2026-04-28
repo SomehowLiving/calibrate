@@ -50,15 +50,15 @@ class TestSTTLeaderboard(unittest.TestCase):
             base = Path(tmp)
             _write_provider(base, "deepgram", {
                 "wer": 0.1,
-                "semantic_match_score": 0.85,
+                "semantic_match": {"type": "binary", "mean": 0.85},
             }, results_rows=[
-                {"id": 1, "gt": "hello", "pred": "hello", "semantic_match_score": True},
+                {"id": 1, "gt": "hello", "pred": "hello", "semantic_match": True},
             ])
             _write_provider(base, "google", {
                 "wer": 0.2,
-                "semantic_match_score": 0.75,
+                "semantic_match": {"type": "binary", "mean": 0.75},
             }, results_rows=[
-                {"id": 1, "gt": "hello", "pred": "hallo", "semantic_match_score": False},
+                {"id": 1, "gt": "hello", "pred": "hallo", "semantic_match": False},
             ])
 
             save_dir = base / "leaderboard"
@@ -69,7 +69,7 @@ class TestSTTLeaderboard(unittest.TestCase):
             self.assertTrue(xlsx.exists())
             summary = pd.read_excel(xlsx, sheet_name="summary")
             self.assertIn("wer", summary.columns)
-            self.assertIn("semantic_match_score", summary.columns)
+            self.assertIn("semantic_match", summary.columns)
             self.assertEqual(set(summary["run"]), {"deepgram", "google"})
 
     def test_custom_criterion_metrics_surface_dynamically(self):
@@ -79,8 +79,8 @@ class TestSTTLeaderboard(unittest.TestCase):
             base = Path(tmp)
             _write_provider(base, "provider-a", {
                 "wer": 0.05,
-                "semantic_match_score": 0.9,
-                "completeness_score": 0.7,
+                "semantic_match": {"type": "binary", "mean": 0.9},
+                "completeness": {"type": "binary", "mean": 0.7},
             })
 
             save_dir = base / "leaderboard"
@@ -88,8 +88,8 @@ class TestSTTLeaderboard(unittest.TestCase):
 
             xlsx = save_dir / "stt_leaderboard.xlsx"
             summary = pd.read_excel(xlsx, sheet_name="summary")
-            self.assertIn("semantic_match_score", summary.columns)
-            self.assertIn("completeness_score", summary.columns)
+            self.assertIn("semantic_match", summary.columns)
+            self.assertIn("completeness", summary.columns)
 
     def test_skips_existing_leaderboard_folder(self):
         """A pre-existing `leaderboard` subdir under output_dir must not be
@@ -97,9 +97,10 @@ class TestSTTLeaderboard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             _write_provider(base, "provider-x", {
-                "wer": 0.1, "semantic_match_score": 1.0,
+                "wer": 0.1,
+                "semantic_match": {"type": "binary", "mean": 1.0},
             }, results_rows=[
-                {"id": 1, "gt": "hi", "pred": "hi", "semantic_match_score": True},
+                {"id": 1, "gt": "hi", "pred": "hi", "semantic_match": True},
             ])
             # Pre-existing leaderboard directory — must be skipped
             (base / "leaderboard").mkdir()
@@ -126,16 +127,16 @@ class TestTTSLeaderboard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             _write_provider(base, "openai", {
-                "pronunciation_score": 0.95,
+                "pronunciation": {"type": "binary", "mean": 0.95},
                 "ttfb": {"mean": 0.4, "std": 0.05, "values": [0.35, 0.45]},
             }, results_rows=[
-                {"id": 1, "text": "hi", "pronunciation_score": True, "ttfb": 0.4},
+                {"id": 1, "text": "hi", "pronunciation": True, "ttfb": 0.4},
             ])
             _write_provider(base, "elevenlabs", {
-                "pronunciation_score": 0.8,
+                "pronunciation": {"type": "binary", "mean": 0.8},
                 "ttfb": {"mean": 0.3, "std": 0.02, "values": [0.29, 0.31]},
             }, results_rows=[
-                {"id": 1, "text": "hi", "pronunciation_score": True, "ttfb": 0.3},
+                {"id": 1, "text": "hi", "pronunciation": True, "ttfb": 0.3},
             ])
 
             save_dir = base / "leaderboard"
@@ -144,15 +145,15 @@ class TestTTSLeaderboard(unittest.TestCase):
             xlsx = save_dir / "tts_leaderboard.xlsx"
             self.assertTrue(xlsx.exists())
             summary = pd.read_excel(xlsx, sheet_name="summary")
-            self.assertIn("pronunciation_score", summary.columns)
+            self.assertIn("pronunciation", summary.columns)
             self.assertIn("ttfb", summary.columns)
 
     def test_multi_criterion_metrics_surface_dynamically(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             _write_provider(base, "provider-a", {
-                "intelligibility_score": 0.9,
-                "pronunciation_score": 0.85,
+                "intelligibility": {"type": "binary", "mean": 0.9},
+                "pronunciation": {"type": "binary", "mean": 0.85},
                 "ttfb": {"mean": 0.4},
             })
 
@@ -161,8 +162,8 @@ class TestTTSLeaderboard(unittest.TestCase):
 
             xlsx = save_dir / "tts_leaderboard.xlsx"
             summary = pd.read_excel(xlsx, sheet_name="summary")
-            self.assertIn("intelligibility_score", summary.columns)
-            self.assertIn("pronunciation_score", summary.columns)
+            self.assertIn("intelligibility", summary.columns)
+            self.assertIn("pronunciation", summary.columns)
             self.assertIn("ttfb", summary.columns)
 
 

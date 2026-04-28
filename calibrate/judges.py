@@ -28,7 +28,7 @@ concurrently; results are stitched back into a single dict keyed by
 Default evaluators are exposed for callers that want to preserve the
 pre-evaluators-API behavior:
 
-- ``DEFAULT_LLM_TEST_EVALUATOR`` (name: ``criteria-passed``)
+- ``DEFAULT_LLM_TEST_EVALUATOR`` (name: ``correctness``)
 - ``DEFAULT_STT_EVALUATOR``      (name: ``semantic_match``)
 - ``DEFAULT_TTS_EVALUATOR``      (name: ``pronunciation``)
 
@@ -38,6 +38,7 @@ Simulation has no implicit default — callers must supply evaluators.
 import asyncio
 import base64
 import os
+import re
 from typing import Literal, Optional
 
 import instructor
@@ -82,7 +83,7 @@ RATING = "rating"
 # default evaluator's name). Simulation has no implicit default.
 
 DEFAULT_LLM_TEST_EVALUATOR = {
-    "name": "criteria-passed",
+    "name": "correctness",
     "system_prompt": (
         "You are a highly accurate evaluator evaluating the response of an agent to a "
         "user's message.\n\n"
@@ -208,6 +209,43 @@ def _rating_range(evaluator: dict) -> list[int]:
     return list(range(lo, hi + 1))
 
 
+# ── Tool / schema names (Azure OpenAI: ^[a-zA-Z0-9_.-]+$) ────────────────────
+
+
+def _sanitize_evaluator_for_tool_model(name: str) -> str:
+    """Return a suffix safe for Pydantic ``create_model`` ``__name__`` / Instructor tool names.
+
+    Providers (e.g. Azure) reject tool names outside ``^[a-zA-Z0-9_.-]+$``.
+    Human-readable evaluator titles often contain spaces or punctuation; map
+    those to underscores and ensure a non-empty, identifier-like string.
+    """
+    raw = (name or "").strip() or "evaluator"
+    s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw)
+    s = re.sub(r"_+", "_", s).strip("_.-") or "evaluator"
+    s = re.sub(r"[.-]", "_", s)
+    s = re.sub(r"_+", "_", s)
+    if s[0].isdigit():
+        s = f"E_{s}"
+    return s
+
+
+def _normalize_judge_api_result(result: dict, model_cls_name: str) -> dict:
+    """If structured output nests fields under the schema/model name, unwrap to a flat dict.
+
+    Callers key the outer result dict by the original evaluator ``name``; this
+    only normalizes the inner payload so downstream always sees
+    ``reasoning`` / ``match`` or ``reasoning`` / ``score``.
+    """
+    if not isinstance(result, dict):
+        return result
+    inner = result.get(model_cls_name)
+    if isinstance(inner, dict) and any(
+        k in inner for k in ("reasoning", "match", "score")
+    ):
+        return dict(inner)
+    return result
+
+
 # ── Pydantic result models ──────────────────────────────────────────────────
 
 
@@ -232,7 +270,8 @@ def _build_rating_result_model(evaluator: dict) -> type[BaseModel]:
 
     scale_min = evaluator["scale_min"]
     scale_max = evaluator["scale_max"]
-    model_name = f"RatingResult_{evaluator.get('name', 'evaluator')}"
+    suffix = _sanitize_evaluator_for_tool_model(str(evaluator.get("name", "evaluator")))
+    model_name = f"RatingResult_{suffix}"
 
     return create_model(
         model_name,
@@ -322,7 +361,7 @@ async def _judge_one_text(
         max_completion_tokens=8192,
     )
 
-    result = response.model_dump()
+    result = _normalize_judge_api_result(response.model_dump(), Output.__name__)
 
     if langfuse_enabled and langfuse:
         langfuse.update_current_span(
@@ -379,7 +418,7 @@ async def _judge_one_audio(
         max_completion_tokens=8192,
     )
 
-    result = response.model_dump()
+    result = _normalize_judge_api_result(response.model_dump(), Output.__name__)
 
     if langfuse_enabled and langfuse:
         from calibrate.langfuse import create_langfuse_audio_media

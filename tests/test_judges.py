@@ -28,6 +28,8 @@ from calibrate.judges import (
     render_evaluator,
     format_conversation,
     _result_model_for_evaluator,
+    _sanitize_evaluator_for_tool_model,
+    _normalize_judge_api_result,
     CriterionResult,
     DEFAULT_TEXT_JUDGE_MODEL,
     DEFAULT_AUDIO_JUDGE_MODEL,
@@ -132,6 +134,46 @@ class TestRenderEvaluator(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tool-name sanitization and API result shape
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeEvaluatorForToolModel(unittest.TestCase):
+    def test_spaces_and_ampersand(self):
+        self.assertEqual(
+            _sanitize_evaluator_for_tool_model("Empathy & Tone"),
+            "Empathy_Tone",
+        )
+
+    def test_goal_completion(self):
+        self.assertEqual(
+            _sanitize_evaluator_for_tool_model("Goal Completion"),
+            "Goal_Completion",
+        )
+
+    def test_leading_digit(self):
+        self.assertEqual(_sanitize_evaluator_for_tool_model("1st pass"), "E_1st_pass")
+
+
+class TestNormalizeJudgeApiResult(unittest.TestCase):
+    def test_flat_dict_unchanged(self):
+        flat = {"reasoning": "ok", "score": 3}
+        self.assertEqual(
+            _normalize_judge_api_result(flat, "RatingResult_x"),
+            flat,
+        )
+
+    def test_unwraps_nested_model_key(self):
+        nested = {
+            "RatingResult_Empathy_Tone": {"reasoning": "ok", "score": 4},
+        }
+        self.assertEqual(
+            _normalize_judge_api_result(nested, "RatingResult_Empathy_Tone"),
+            {"reasoning": "ok", "score": 4},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Result model construction
 # ---------------------------------------------------------------------------
 
@@ -175,6 +217,18 @@ class TestResultModelForEvaluator(unittest.TestCase):
         )
         with self.assertRaises(ValidationError):
             Output(reasoning="x", score=5)
+
+    def test_rating_model_name_sanitizes_evaluator_title(self):
+        Output = _result_model_for_evaluator(
+            {
+                "name": "Empathy & Tone",
+                "type": "rating",
+                "scale_min": 1,
+                "scale_max": 5,
+                "system_prompt": "rate",
+            }
+        )
+        self.assertEqual(Output.__name__, "RatingResult_Empathy_Tone")
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +299,41 @@ class TestTextJudge(unittest.IsolatedAsyncioTestCase):
         )
         # One LLM call per evaluator
         self.assertEqual(client.chat.completions.create.await_count, 2)
+
+    async def test_rating_nested_payload_keyed_by_original_evaluator_name(self):
+        """Outer dict keys stay human-readable; nested tool-shaped payloads flatten."""
+        client = _mock_instructor_chat_completions(
+            [
+                {
+                    "RatingResult_Empathy_Tone": {
+                        "reasoning": "warm",
+                        "score": 4,
+                    }
+                },
+            ]
+        )
+        with patch(
+            "calibrate.judges.instructor.apatch", return_value=client
+        ), patch(
+            "calibrate.judges._build_openrouter_client", return_value=MagicMock()
+        ):
+            result = await text_judge(
+                evaluators=[
+                    {
+                        "name": "Empathy & Tone",
+                        "type": "rating",
+                        "scale_min": 1,
+                        "scale_max": 5,
+                        "system_prompt": "rate empathy",
+                        "judge_model": "openai/gpt-4.1",
+                    },
+                ],
+                user_prompt="ctx",
+            )
+        self.assertEqual(
+            result,
+            {"Empathy & Tone": {"reasoning": "warm", "score": 4}},
+        )
 
     async def test_uses_evaluator_judge_model(self):
         client = _mock_instructor_chat_completions(
@@ -531,7 +620,7 @@ class TestFormatConversation(unittest.TestCase):
 
 class TestDefaultEvaluators(unittest.TestCase):
     def test_llm_test_default_evaluator_shape(self):
-        self.assertEqual(DEFAULT_LLM_TEST_EVALUATOR["name"], "criteria-passed")
+        self.assertEqual(DEFAULT_LLM_TEST_EVALUATOR["name"], "correctness")
         self.assertIn("{{criteria}}", DEFAULT_LLM_TEST_EVALUATOR["system_prompt"])
         self.assertEqual(
             DEFAULT_LLM_TEST_EVALUATOR["judge_model"], DEFAULT_TEXT_JUDGE_MODEL

@@ -767,11 +767,14 @@ async def run_single_provider_eval(
         # Map evaluator name → evaluator dict (for per-row value extraction)
         _evaluators_by_name = {ev["name"]: ev for ev in _evaluators}
 
-        # Build metrics data — scalar mean per criterion (chart compat) + full info dict
+        # Each evaluator gets one entry keyed by its name. The value is the
+        # full per-criterion dict (``type``, ``mean``, plus ``scale_min``/
+        # ``scale_max`` for ratings). Downstream consumers (leaderboard,
+        # summary print, UI) detect evaluators as dict values that carry a
+        # ``type`` field.
         metrics_data = {}
         for name, score_dict in llm_judge_results["scores"].items():
-            metrics_data[f"{name}_score"] = score_dict["mean"]
-            metrics_data[f"{name}_info"] = score_dict
+            metrics_data[name] = score_dict
 
         # Add ttfb metrics with mean, std, and values (filter out None/NaN values)
         valid_ttfb = [
@@ -811,9 +814,9 @@ async def run_single_provider_eval(
             for name, ev in _evaluators_by_name.items():
                 ev_result = llm_row[name]
                 if is_rating(ev):
-                    row[f"{name}_score"] = ev_result["score"]
+                    row[name] = ev_result["score"]
                 else:
-                    row[f"{name}_score"] = bool(ev_result["match"])
+                    row[name] = bool(ev_result["match"])
                 row[f"{name}_reasoning"] = ev_result["reasoning"]
             data.append(row)
 
@@ -935,7 +938,13 @@ async def main():
         print(f"  {provider}: \033[31mError - {result.get('error')}\033[0m")
     else:
         metrics = result.get("metrics", {})
-        judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+        # Evaluator entries are dicts carrying a ``type`` field; ttfb has no
+        # ``type`` so it's correctly excluded from the judge-score string.
+        judge_scores = {
+            k: v["mean"]
+            for k, v in metrics.items()
+            if isinstance(v, dict) and "type" in v
+        }
         ttfb_data = metrics.get("ttfb", {})
         ttfb_mean = (
             ttfb_data.get("mean", "N/A") if isinstance(ttfb_data, dict) else "N/A"

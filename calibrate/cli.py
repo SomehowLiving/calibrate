@@ -520,6 +520,7 @@ Examples:
                                 test_cases=_config["test_cases"],
                                 output_dir=args.output_dir,
                                 models=[_m],
+                                evaluators=_config.get("evaluators"),
                             )
                         )
                         _model_results[_m] = _result.get(_m, _result)
@@ -539,6 +540,7 @@ Examples:
                             agent=_agent,
                             test_cases=_config["test_cases"],
                             output_dir=args.output_dir,
+                            evaluators=_config.get("evaluators"),
                         )
                     )
             else:

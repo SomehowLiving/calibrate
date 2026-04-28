@@ -868,10 +868,13 @@ async def run_single_provider_eval(
         metrics_data = {
             "wer": wer_results["score"],
         }
-        # Per-criterion aggregate: scalar mean for chart compat, full dict under `_info`
+        # Each evaluator gets one entry keyed by its name. The value is the
+        # full per-criterion dict (``type``, ``mean``, plus ``scale_min``/
+        # ``scale_max`` for ratings). Downstream consumers (leaderboard,
+        # summary print, UI) detect evaluators as dict values that carry a
+        # ``type`` field.
         for name, score_dict in llm_results["scores"].items():
-            metrics_data[f"{name}_score"] = score_dict["mean"]
-            metrics_data[f"{name}_info"] = score_dict
+            metrics_data[name] = score_dict
 
         data = []
         for _id, gt_text, pred_text, wer, llm_row in zip(
@@ -890,9 +893,9 @@ async def run_single_provider_eval(
             for name, ev in _evaluators_by_name.items():
                 ev_result = llm_row[name]
                 if is_rating(ev):
-                    row[f"{name}_score"] = ev_result["score"]
+                    row[name] = ev_result["score"]
                 else:
-                    row[f"{name}_score"] = bool(ev_result["match"])
+                    row[name] = bool(ev_result["match"])
                 row[f"{name}_reasoning"] = ev_result["reasoning"]
             data.append(row)
 
@@ -1034,8 +1037,13 @@ async def main():
     else:
         metrics = result.get("metrics", {})
         wer = metrics.get("wer", 0)
-        # Print all judge score metrics
-        judge_scores = {k: v for k, v in metrics.items() if k.endswith("_score")}
+        # Evaluator entries are dicts carrying a ``type`` field; that's the
+        # marker we use to pick them out from other top-level metrics.
+        judge_scores = {
+            k: v["mean"]
+            for k, v in metrics.items()
+            if isinstance(v, dict) and "type" in v
+        }
         judge_str = ", ".join(f"{k}={v:.4f}" for k, v in judge_scores.items())
         print(f"  {provider}: WER={wer:.4f}, {judge_str}")
 

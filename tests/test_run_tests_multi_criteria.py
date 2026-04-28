@@ -3,7 +3,8 @@ Tests for multi-evaluator LLM test evaluation.
 
 Covers:
 - run_test_external with multi-evaluator returns per-evaluator judge_results
-- "passed" is True iff ALL binary evaluators match (rating evaluators are informational)
+- "passed" is True iff every referenced evaluator passes (AND): binary evaluators
+  must match and rating evaluators must reach ``scale_max``
 - _aggregate_criteria aggregates pass rates / rating means correctly across test cases
 
 Run with:
@@ -138,17 +139,29 @@ class TestRunTestExternalMultiCriteria(unittest.IsolatedAsyncioTestCase):
             result["metrics"]["reasoning"], "All evaluators passed"
         )
 
-    async def test_rating_evaluator_does_not_affect_passed_flag(self):
-        """Rating evaluators are informational — they don't fail the test."""
+    async def test_rating_below_scale_max_fails_test_case(self):
+        """A rating evaluator below scale_max fails the test case."""
         result = await self._run(
             agent_response="Hello!",
-            evaluators=[_rating_ev("fluency")],
+            evaluators=[_rating_ev("fluency", lo=1, hi=5)],
             judge_result={"fluency": {"score": 2, "reasoning": "meh"}},
         )
-        # Low rating score does NOT fail the test
-        self.assertTrue(result["metrics"]["passed"])
+        self.assertFalse(result["metrics"]["passed"])
+        self.assertEqual(result["metrics"]["reasoning"], "meh")
         self.assertEqual(
             result["metrics"]["judge_results"]["fluency"]["score"], 2
+        )
+
+    async def test_rating_at_scale_max_passes_test_case(self):
+        """A rating evaluator equal to scale_max passes the test case."""
+        result = await self._run(
+            agent_response="Hello!",
+            evaluators=[_rating_ev("fluency", lo=1, hi=5)],
+            judge_result={"fluency": {"score": 5, "reasoning": "great"}},
+        )
+        self.assertTrue(result["metrics"]["passed"])
+        self.assertEqual(
+            result["metrics"]["judge_results"]["fluency"]["score"], 5
         )
 
     async def test_mixed_binary_fails_overrides_rating(self):
@@ -197,7 +210,7 @@ class TestAggregateCriteria(unittest.TestCase):
         self.assertEqual(_aggregate_criteria(results, self._registry()), {})
 
     def test_string_criteria_aggregates_under_default_evaluator(self):
-        """String criteria are normalized to the implicit ``criteria-passed`` evaluator."""
+        """String criteria are normalized to the implicit ``correctness`` evaluator."""
         from calibrate.llm.run_tests import _aggregate_criteria
         results = [
             {
@@ -205,7 +218,7 @@ class TestAggregateCriteria(unittest.TestCase):
                     "passed": True,
                     "reasoning": "ok",
                     "judge_results": {
-                        "criteria-passed": {"match": True, "reasoning": "ok"},
+                        "correctness": {"match": True, "reasoning": "ok"},
                     },
                 },
                 "test_case": {"evaluation": {"type": "response", "criteria": "X"}},
@@ -215,17 +228,17 @@ class TestAggregateCriteria(unittest.TestCase):
                     "passed": False,
                     "reasoning": "bad",
                     "judge_results": {
-                        "criteria-passed": {"match": False, "reasoning": "bad"},
+                        "correctness": {"match": False, "reasoning": "bad"},
                     },
                 },
                 "test_case": {"evaluation": {"type": "response", "criteria": "Y"}},
             },
         ]
         agg = _aggregate_criteria(results, self._registry())
-        self.assertIn("criteria-passed", agg)
-        self.assertEqual(agg["criteria-passed"]["passed"], 1)
-        self.assertEqual(agg["criteria-passed"]["total"], 2)
-        self.assertEqual(agg["criteria-passed"]["pass_rate"], 50.0)
+        self.assertIn("correctness", agg)
+        self.assertEqual(agg["correctness"]["passed"], 1)
+        self.assertEqual(agg["correctness"]["total"], 2)
+        self.assertEqual(agg["correctness"]["pass_rate"], 50.0)
 
     def test_multi_evaluators_counted_independently(self):
         from calibrate.llm.run_tests import _aggregate_criteria
@@ -355,7 +368,7 @@ class TestAggregateCriteria(unittest.TestCase):
                     "passed": True,
                     "reasoning": "ok",
                     "judge_results": {
-                        "criteria-passed": {"match": True, "reasoning": "ok"},
+                        "correctness": {"match": True, "reasoning": "ok"},
                     },
                 },
                 "test_case": {"evaluation": {"type": "response", "criteria": "X"}},
@@ -387,8 +400,8 @@ class TestAggregateCriteria(unittest.TestCase):
             },
         ]
         agg = _aggregate_criteria(results, self._registry(accuracy, tone))
-        self.assertEqual(set(agg.keys()), {"criteria-passed", "accuracy", "tone"})
-        self.assertEqual(agg["criteria-passed"]["total"], 1)
+        self.assertEqual(set(agg.keys()), {"correctness", "accuracy", "tone"})
+        self.assertEqual(agg["correctness"]["total"], 1)
         self.assertEqual(agg["accuracy"]["total"], 1)
         self.assertEqual(agg["tone"]["total"], 1)
 

@@ -183,7 +183,7 @@ Each evaluator's `system_prompt` is sent as the system message to its own dedica
 
 ### Quick start: single criterion
 
-The simplest setup needs no top-level `evaluators`. Pass `criteria` as a string and the implicit `criteria-passed` evaluator runs. The string is substituted into the default evaluator's system prompt as the `{{criteria}}` variable:
+The simplest setup needs no top-level `evaluators`. Pass `criteria` as a string and the implicit `correctness` evaluator runs. The string is substituted into the default evaluator's system prompt as the `{{criteria}}` variable:
 
 ```json
 {
@@ -248,7 +248,7 @@ A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in 
 {
   "evaluators": [
     {
-      "name": "criteria-passed",
+      "name": "correctness",
       "system_prompt": "You are a highly accurate evaluator. Evaluate whether the agent's response satisfies: {{criteria}}",
       "judge_model": "openai/gpt-4.1"
     }
@@ -259,7 +259,7 @@ A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in 
       "evaluation": {
         "type": "response",
         "criteria": [
-          { "name": "criteria-passed", "arguments": { "criteria": "Politely redirect off-topic questions." } }
+          { "name": "correctness", "arguments": { "criteria": "Politely redirect off-topic questions." } }
         ]
       }
     }
@@ -267,7 +267,7 @@ A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in 
 }
 ```
 
-The string-form `criteria` (shown in the quick start above) is just a shortcut for the implicit `criteria-passed` evaluator with `{ "arguments": { "criteria": "<your string>" } }`.
+The string-form `criteria` (shown in the quick start above) is just a shortcut for the implicit `correctness` evaluator with `{ "arguments": { "criteria": "<your string>" } }`.
 
 ### Binary vs rating
 
@@ -276,7 +276,7 @@ Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluat
 A test case passes only when **all** binary evaluators match. Rating evaluators are **informational** — they produce a mean score per model but don't affect pass/fail. Use a binary evaluator like `"is the tone rating at least 4?"` if you want to gate on a score.
 
 <Note>
-  The `evaluators` key is optional. When omitted, the implicit `criteria-passed` evaluator is used and `criteria` may be passed as a plain string.
+  The `evaluators` key is optional. When omitted, the implicit `correctness` evaluator is used and `criteria` may be passed as a plain string.
 </Note>
 
 ---

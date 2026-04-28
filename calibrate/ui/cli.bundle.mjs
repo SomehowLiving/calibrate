@@ -49838,33 +49838,34 @@ function getAllProviders(mode2) {
   return mode2 === "tts" ? TTS_PROVIDERS : STT_PROVIDERS;
 }
 var RESERVED_METRIC_KEYS = /* @__PURE__ */ new Set(["wer", "ttfb", "count", "provider"]);
+function isEvaluatorEntry(value) {
+  if (!value || typeof value !== "object") return false;
+  const t = value["type"];
+  return t === "binary" || t === "rating";
+}
 function evaluatorNamesFromMetrics(data) {
-  return Object.keys(data).filter((k) => k.endsWith("_score")).map((k) => k.slice(0, -"_score".length)).filter((n) => !RESERVED_METRIC_KEYS.has(n));
+  return Object.keys(data).filter((k) => isEvaluatorEntry(data[k]));
 }
 function evaluatorScoresFromMetrics(data) {
   const out = {};
   for (const name of evaluatorNamesFromMetrics(data)) {
-    const v = data[`${name}_score`];
-    out[name] = typeof v === "number" ? v : Number(v) || 0;
+    const entry = data[name];
+    const mean = entry["mean"];
+    out[name] = typeof mean === "number" ? mean : Number(mean) || 0;
   }
   return out;
 }
 function evaluatorMetaFromMetrics(data) {
   const out = {};
-  for (const key of Object.keys(data)) {
-    if (!key.endsWith("_info")) continue;
-    const name = key.slice(0, -"_info".length);
-    if (RESERVED_METRIC_KEYS.has(name)) continue;
-    const info = data[key];
-    if (!info || typeof info !== "object") continue;
-    const i = info;
-    const type = i["type"] === "rating" ? "rating" : "binary";
+  for (const name of evaluatorNamesFromMetrics(data)) {
+    const entry = data[name];
+    const type = entry["type"] === "rating" ? "rating" : "binary";
     const meta = { type };
     if (type === "rating") {
-      if (typeof i["scale_min"] === "number")
-        meta.scale_min = i["scale_min"];
-      if (typeof i["scale_max"] === "number")
-        meta.scale_max = i["scale_max"];
+      if (typeof entry["scale_min"] === "number")
+        meta.scale_min = entry["scale_min"];
+      if (typeof entry["scale_max"] === "number")
+        meta.scale_max = entry["scale_max"];
     }
     out[name] = meta;
   }
@@ -49881,7 +49882,14 @@ function evaluatorScoreColor(score, meta) {
   return passed ? "green" : failed ? "red" : void 0;
 }
 function evaluatorNamesFromCsvHeaders(headers) {
-  return headers.filter((h) => h.endsWith("_score")).map((h) => h.slice(0, -"_score".length)).filter((n) => !RESERVED_METRIC_KEYS.has(n));
+  const headerSet = new Set(headers);
+  const names = [];
+  for (const h of headers) {
+    if (RESERVED_METRIC_KEYS.has(h)) continue;
+    if (h.endsWith("_reasoning")) continue;
+    if (headerSet.has(`${h}_reasoning`)) names.push(h);
+  }
+  return names;
 }
 function unionEvaluatorNames(metrics) {
   const seen = /* @__PURE__ */ new Set();
@@ -50698,13 +50706,19 @@ function LeaderboardStep({ config }) {
         return;
       }
       const headers = parseCSVLine(lines[0]);
+      const headerSet = new Set(headers);
+      const evaluatorScoreColumns = new Set(
+        headers.filter(
+          (h) => !h.endsWith("_reasoning") && headerSet.has(`${h}_reasoning`)
+        )
+      );
       const rows = [];
       for (let i = 1; i < lines.length; i++) {
         const values = parseCSVLine(lines[i]);
         const row = { id: "" };
         headers.forEach((h, idx) => {
           const val = values[idx] || "";
-          const isNumericMetric = h === "wer" || h === "ttfb" || h.endsWith("_score");
+          const isNumericMetric = h === "wer" || h === "ttfb" || evaluatorScoreColumns.has(h);
           if (isNumericMetric) {
             const num = parseFloat(val);
             row[h] = isNaN(num) ? val : num;
@@ -50939,7 +50953,7 @@ function LeaderboardStep({ config }) {
                 {
                   color: isSelected ? "cyan" : void 0,
                   children: " | " + formatEvaluatorCell(
-                    r[`${name}_score`],
+                    r[name],
                     evaluatorMeta[name]
                   ).padStart(10)
                 },
@@ -50971,7 +50985,7 @@ function LeaderboardStep({ config }) {
               };
               for (const name of detailEvaluatorNames) {
                 row[name] = formatEvaluatorCell(
-                  r[`${name}_score`],
+                  r[name],
                   evaluatorMeta[name]
                 );
               }
@@ -51008,7 +51022,7 @@ function LeaderboardStep({ config }) {
             for (const name of detailEvaluatorNames) {
               const reasoning = String(r[`${name}_reasoning`] || "");
               if (!reasoning || reasoning === "-") continue;
-              const score = r[`${name}_score`] ?? "-";
+              const score = r[name] ?? "-";
               const color = evaluatorScoreColor(
                 score,
                 evaluatorMeta[name]
@@ -51047,7 +51061,7 @@ function LeaderboardStep({ config }) {
             for (const name of detailEvaluatorNames) {
               const reasoning = String(r[`${name}_reasoning`] || "");
               if (!reasoning || reasoning === "-") continue;
-              const score = r[`${name}_score`] ?? "-";
+              const score = r[name] ?? "-";
               const color = evaluatorScoreColor(
                 score,
                 evaluatorMeta[name]

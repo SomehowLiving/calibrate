@@ -74,29 +74,10 @@ function getAllProviders(mode: EvalMode) {
   return mode === "tts" ? TTS_PROVIDERS : STT_PROVIDERS;
 }
 
-// Reserved metrics.json keys that are NOT evaluator-derived. Anything else
-// ending in ``_score`` is treated as ``<evaluator>_score``.
+// Reserved metrics.json keys that look numeric but are not evaluator-
+// derived (used by CSV-header scanners which don't have access to the
+// nested metric values).
 const RESERVED_METRIC_KEYS = new Set(["wer", "ttfb", "count", "provider"]);
-
-function evaluatorNamesFromMetrics(
-  data: Record<string, unknown>
-): string[] {
-  return Object.keys(data)
-    .filter((k) => k.endsWith("_score"))
-    .map((k) => k.slice(0, -"_score".length))
-    .filter((n) => !RESERVED_METRIC_KEYS.has(n));
-}
-
-function evaluatorScoresFromMetrics(
-  data: Record<string, unknown>
-): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const name of evaluatorNamesFromMetrics(data)) {
-    const v = data[`${name}_score`];
-    out[name] = typeof v === "number" ? v : Number(v) || 0;
-  }
-  return out;
-}
 
 type EvaluatorInfo = {
   type: "binary" | "rating";
@@ -104,26 +85,47 @@ type EvaluatorInfo = {
   scale_max?: number;
 };
 
-// Extract per-evaluator metadata (type + rating scale) from metrics.json
-// `<name>_info` entries written by the backend.
+// Each evaluator entry in metrics.json is a dict carrying a ``type`` field
+// (``"binary"`` or ``"rating"``) alongside its ``mean``. That ``type`` key
+// is the unambiguous marker for an evaluator vs other metrics like ``wer``
+// (a plain number) or ``ttfb`` (a dict without ``type``).
+function isEvaluatorEntry(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const t = (value as Record<string, unknown>)["type"];
+  return t === "binary" || t === "rating";
+}
+
+function evaluatorNamesFromMetrics(
+  data: Record<string, unknown>
+): string[] {
+  return Object.keys(data).filter((k) => isEvaluatorEntry(data[k]));
+}
+
+function evaluatorScoresFromMetrics(
+  data: Record<string, unknown>
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const name of evaluatorNamesFromMetrics(data)) {
+    const entry = data[name] as Record<string, unknown>;
+    const mean = entry["mean"];
+    out[name] = typeof mean === "number" ? mean : Number(mean) || 0;
+  }
+  return out;
+}
+
 function evaluatorMetaFromMetrics(
   data: Record<string, unknown>
 ): Record<string, EvaluatorInfo> {
   const out: Record<string, EvaluatorInfo> = {};
-  for (const key of Object.keys(data)) {
-    if (!key.endsWith("_info")) continue;
-    const name = key.slice(0, -"_info".length);
-    if (RESERVED_METRIC_KEYS.has(name)) continue;
-    const info = data[key];
-    if (!info || typeof info !== "object") continue;
-    const i = info as Record<string, unknown>;
-    const type = i["type"] === "rating" ? "rating" : "binary";
+  for (const name of evaluatorNamesFromMetrics(data)) {
+    const entry = data[name] as Record<string, unknown>;
+    const type = entry["type"] === "rating" ? "rating" : "binary";
     const meta: EvaluatorInfo = { type };
     if (type === "rating") {
-      if (typeof i["scale_min"] === "number")
-        meta.scale_min = i["scale_min"] as number;
-      if (typeof i["scale_max"] === "number")
-        meta.scale_max = i["scale_max"] as number;
+      if (typeof entry["scale_min"] === "number")
+        meta.scale_min = entry["scale_min"] as number;
+      if (typeof entry["scale_max"] === "number")
+        meta.scale_max = entry["scale_max"] as number;
     }
     out[name] = meta;
   }
@@ -152,11 +154,19 @@ function evaluatorScoreColor(
   return passed ? "green" : failed ? "red" : undefined;
 }
 
+// Evaluator columns in results.csv are paired: ``<name>`` carries the
+// score and ``<name>_reasoning`` carries the judge's free-text reason.
+// We discover evaluators by looking for headers that have a matching
+// ``_reasoning`` companion — this is robust to arbitrary evaluator names.
 function evaluatorNamesFromCsvHeaders(headers: string[]): string[] {
-  return headers
-    .filter((h) => h.endsWith("_score"))
-    .map((h) => h.slice(0, -"_score".length))
-    .filter((n) => !RESERVED_METRIC_KEYS.has(n));
+  const headerSet = new Set(headers);
+  const names: string[] = [];
+  for (const h of headers) {
+    if (RESERVED_METRIC_KEYS.has(h)) continue;
+    if (h.endsWith("_reasoning")) continue;
+    if (headerSet.has(`${h}_reasoning`)) names.push(h);
+  }
+  return names;
 }
 
 function unionEvaluatorNames(
@@ -1306,17 +1316,25 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
         return;
       }
       const headers = parseCSVLine(lines[0]!);
+      // Evaluator score columns sit next to a `<name>_reasoning` companion,
+      // so we can detect them without relying on a suffix in the column name.
+      const headerSet = new Set(headers);
+      const evaluatorScoreColumns = new Set(
+        headers.filter(
+          (h) => !h.endsWith("_reasoning") && headerSet.has(`${h}_reasoning`)
+        )
+      );
       const rows: ProviderResult[] = [];
       for (let i = 1; i < lines.length; i++) {
         const values = parseCSVLine(lines[i]!);
         const row: ProviderResult = { id: "" };
         headers.forEach((h, idx) => {
           const val = values[idx] || "";
-          // Numeric columns: wer, ttfb, and any per-evaluator `<name>_score`.
+          // Numeric columns: wer, ttfb, and any per-evaluator score column.
           // Boolean-looking score values (True/False) stay as strings so the
           // row table can render Pass/Fail badges.
           const isNumericMetric =
-            h === "wer" || h === "ttfb" || h.endsWith("_score");
+            h === "wer" || h === "ttfb" || evaluatorScoreColumns.has(h);
           if (isNumericMetric) {
             const num = parseFloat(val);
             row[h] = isNaN(num) ? val : num;
@@ -1522,7 +1540,8 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
     );
     const truncate = (s: string, max: number) =>
       s.length > max ? s.slice(0, max - 1) + "…" : s;
-    // Discover per-evaluator columns from results.csv headers (`<name>_score`).
+    // Discover per-evaluator columns from results.csv headers — each
+    // evaluator has a paired ``<name>`` score and ``<name>_reasoning`` column.
     const detailEvaluatorNames =
       providerResults.length > 0
         ? evaluatorNamesFromCsvHeaders(Object.keys(providerResults[0]!))
@@ -1612,7 +1631,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                         >
                           {" | " +
                             formatEvaluatorCell(
-                              r[`${name}_score`],
+                              r[name],
                               evaluatorMeta[name]
                             ).padStart(10)}
                         </Text>
@@ -1644,7 +1663,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   };
                   for (const name of detailEvaluatorNames) {
                     row[name] = formatEvaluatorCell(
-                      r[`${name}_score`],
+                      r[name],
                       evaluatorMeta[name]
                     );
                   }
@@ -1701,7 +1720,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   for (const name of detailEvaluatorNames) {
                     const reasoning = String(r[`${name}_reasoning`] || "");
                     if (!reasoning || reasoning === "-") continue;
-                    const score = r[`${name}_score`] ?? "-";
+                    const score = r[name] ?? "-";
                     const color = evaluatorScoreColor(
                       score,
                       evaluatorMeta[name]
@@ -1756,7 +1775,7 @@ function LeaderboardStep({ config }: { config: EvalConfig }) {
                   for (const name of detailEvaluatorNames) {
                     const reasoning = String(r[`${name}_reasoning`] || "");
                     if (!reasoning || reasoning === "-") continue;
-                    const score = r[`${name}_score`] ?? "-";
+                    const score = r[name] ?? "-";
                     const color = evaluatorScoreColor(
                       score,
                       evaluatorMeta[name]

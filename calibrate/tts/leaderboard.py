@@ -76,10 +76,8 @@ def _read_leaderboard_metrics(metrics_path: Path) -> dict:
     metrics = {}
     if isinstance(data, dict) and "metric_name" not in data:
         for key, value in data.items():
-            # Skip `_info` auxiliary keys (full per-criterion dicts) — scalar
-            # `_score` entries carry the display value for the table.
-            if key.endswith("_info"):
-                continue
+            # Evaluator entries and ttfb are dicts carrying a ``mean`` —
+            # extract that scalar for the table. Plain numbers are kept as-is.
             if isinstance(value, dict) and "mean" in value:
                 metrics[key] = value["mean"]
             elif isinstance(value, (int, float)):

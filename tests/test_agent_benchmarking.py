@@ -108,7 +108,7 @@ class TestRunTestExternalModelParams(unittest.IsolatedAsyncioTestCase):
 
         evaluation = {"type": "response", "criteria": "Agent answers the question"}
         mock_judge = AsyncMock(
-            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+            return_value={"correctness": {"match": True, "reasoning": "ok"}}
         )
 
         with ctx, patch("calibrate.llm.run_tests.test_response_llm_judge", mock_judge):
@@ -130,7 +130,7 @@ class TestRunTestExternalModelParams(unittest.IsolatedAsyncioTestCase):
         agent = TextAgentConnection(url="http://fake-agent/chat")
         ctx, mock_client = _patch_httpx({"response": "hello"})
         mock_judge = AsyncMock(
-            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+            return_value={"correctness": {"match": True, "reasoning": "ok"}}
         )
 
         with ctx, patch("calibrate.llm.run_tests.test_response_llm_judge", mock_judge):
@@ -226,7 +226,7 @@ class TestFolderNaming(unittest.IsolatedAsyncioTestCase):
             }
         ]
         mock_judge = AsyncMock(
-            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+            return_value={"correctness": {"match": True, "reasoning": "ok"}}
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -277,7 +277,7 @@ class TestFolderNaming(unittest.IsolatedAsyncioTestCase):
             }
         ]
         mock_judge = AsyncMock(
-            return_value={"criteria-passed": {"match": True, "reasoning": "ok"}}
+            return_value={"correctness": {"match": True, "reasoning": "ok"}}
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:

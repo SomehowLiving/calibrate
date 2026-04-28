@@ -313,8 +313,11 @@ async def main():
             else:
                 metrics = prov_result.get("metrics", {})
                 wer = metrics.get("wer", 0)
+                # Evaluator entries are dicts carrying a ``type`` field.
                 judge_scores = {
-                    k: v for k, v in metrics.items() if k.endswith("_score")
+                    k: v["mean"]
+                    for k, v in metrics.items()
+                    if isinstance(v, dict) and "type" in v
                 }
                 judge_str = ", ".join(
                     f"{k}={v:.4f}" for k, v in judge_scores.items()
