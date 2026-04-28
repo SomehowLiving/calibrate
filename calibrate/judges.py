@@ -499,7 +499,8 @@ async def audio_judge(
     if not evaluators:
         return {}
 
-    audio_b64 = base64.b64encode(open(audio_path, "rb").read()).decode("utf-8")
+    with open(audio_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     coros = [
         _judge_one_audio(ev, reference_text, audio_path, audio_b64, fallback_model)
