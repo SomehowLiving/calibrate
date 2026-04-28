@@ -33,6 +33,7 @@ from pipecat.frames.frames import (
     FunctionCallResultProperties,
 )
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from calibrate.judges import require_simulation_evaluators
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.pipeline.pipeline import Pipeline
@@ -285,6 +286,8 @@ async def run_simulation(
     fallback_judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
 ) -> List[str]:
     """Runs a text-only bot that processes text inputs through an LLM and returns text outputs."""
+    require_simulation_evaluators(evaluators)
+
     # Create LLM service
 
     if bot_provider == "openrouter":
@@ -580,6 +583,8 @@ async def run_simulation_with_agent(
     Returns:
         dict with ``transcript`` and ``evaluation_results`` keys.
     """
+    require_simulation_evaluators(evaluators)
+
     from openai import AsyncOpenAI as _AsyncOpenAI
 
     # User LLM client
@@ -884,6 +889,12 @@ async def main():
 
     with open(args.config, "r") as f:
         config = json.load(f)
+
+    try:
+        require_simulation_evaluators(config.get("evaluators"))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     output_dir = args.output_dir
 

@@ -54,7 +54,7 @@ The evaluation runs providers in parallel (max 2 at a time), showing the transcr
 
 ## Evaluator configuration
 
-By default, a text LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether each transcription matches the reference text semantically. You can customize the judge model and add multiple evaluators by passing an optional config file with `--config`:
+By default, a text LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether each transcription matches the reference text semantically using the built-in **`semantic_match`** evaluator; expand **Default evaluator: semantic_match** below for the exact `system_prompt` from the codebase. You can customize the judge model and add multiple evaluators by passing an optional config file with `--config`:
 
 ```bash
 calibrate stt -p deepgram google -i ./data -o ./out --config config.json
@@ -70,31 +70,31 @@ The config file supports:
     {
       "name": "semantic_match",
       "system_prompt": "You are a highly accurate evaluator. You will be given a source text and a transcription. Mark True if the values represented by both strings match semantically.",
-      "judge_model": "openai/gpt-4.1"
+      "judge_model": "openai/gpt-5.4-mini"
     },
     {
       "name": "completeness",
       "system_prompt": "You are a highly accurate evaluator. You will be given a source text and a transcription. Mark True if all information from the source text is present in the transcription.",
-      "judge_model": "openai/gpt-4.1"
+      "judge_model": "openai/gpt-5.4-mini"
     }
   ]
 }
 ```
 
-| Key                       | Type   | Description                                                                  |
-| ------------------------- | ------ | ---------------------------------------------------------------------------- |
-| `evaluators`              | array  | List of evaluators. Each one becomes its own LLM call per row.               |
-| `evaluators[].name`       | string | Unique evaluator name. Becomes the column name in the leaderboard.           |
-| `evaluators[].system_prompt` | string | Full system prompt used for this evaluator's LLM judge call.              |
-| `evaluators[].judge_model` | string | OpenRouter model id for this evaluator (default: `openai/gpt-4.1`). Use any model in the [OpenRouter catalog](https://openrouter.ai/models). |
+| Key                          | Type   | Description                                                                                                                                       |
+| ---------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `evaluators`                 | array  | List of evaluators. Each one becomes its own LLM call per row.                                                                                    |
+| `evaluators[].name`          | string | Unique evaluator name. Becomes the column name in the leaderboard.                                                                                |
+| `evaluators[].system_prompt` | string | Full system prompt used for this evaluator's LLM judge call.                                                                                      |
+| `evaluators[].judge_model`   | string | OpenRouter model id for this evaluator (default: `openai/gpt-5.4-mini`). Use any model in the [OpenRouter catalog](https://openrouter.ai/models). |
 
 Each evaluator also accepts:
 
-| Key         | Type    | Description                                                            |
-| ----------- | ------- | ---------------------------------------------------------------------- |
-| `type`      | string  | `"binary"` (default) or `"rating"`                                     |
-| `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.              |
-| `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score.             |
+| Key         | Type    | Description                                                |
+| ----------- | ------- | ---------------------------------------------------------- |
+| `type`      | string  | `"binary"` (default) or `"rating"`                         |
+| `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.  |
+| `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score. |
 
 Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluators produce an integer score on your scale and a mean score in the leaderboard.
 
@@ -103,8 +103,31 @@ When multiple evaluators are defined, each is scored independently — one LLM c
 Refer to the [sample config](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/stt/config.json) for a template.
 
 <Note>
-  The `--config` flag is optional. When omitted, a single built-in `semantic_match` evaluator scores semantic match between source and transcription.
+  The `--config` flag is optional. When omitted, a single built-in
+  `semantic_match` evaluator scores semantic match between source and
+  transcription.
 </Note>
+
+<AccordionGroup>
+  <Accordion title="semantic_match (default evaluator system prompt)">
+    Matches [`DEFAULT_STT_EVALUATOR`](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/calibrate/judges.py) in `calibrate/judges.py` when no `--config` is passed.
+
+    ```text
+    You are a highly accurate evaluator evaluating the transcription output of an STT model.
+
+    You will be given two strings - one is the source string used to produce an audio and the other is the transcription of that audio.
+
+    You need to evaluate if the two strings are the same.
+
+    # Important Instructions:
+    - Check whether the values represented by both the strings match. E.g. if one string says 1,2,3 but the other string says "one, two, three" or "one, 2, three", they should be considered the same as their underlying value is the same. However, if the actual values itself are different, e.g. for the name of a person or address or the value of any other key detail - that difference should be noted.
+    - Ignore differences like a word being split up into more than 1 word by spaces. Look at whether the values mean the same in both the strings.
+    - Minor differences in values of entities (e.g. proper nouns, numbers) matter and should be considered an error.
+    - If all the "values" for the strings match, mark it as True. Else, False.
+    ```
+
+  </Accordion>
+</AccordionGroup>
 
 ## Output
 

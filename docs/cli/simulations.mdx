@@ -82,22 +82,23 @@ An array of scenarios that define different conversation patterns to test. For a
 
 ## Evaluators
 
-An array of LLM judges used to evaluate the agent's performance. Each evaluator becomes its own LLM call per simulation — all evaluators run in parallel against the same conversation transcript.
+An array of LLM judges used to evaluate the agent's performance. Each evaluator becomes its own LLM call per simulation — all evaluators run in parallel against the entire conversation transcript.
 
 <Note>
-  Simulations have **no implicit defaults**. You must define every evaluator
-  yourself, including all of the context (such as the agent's role) that the
-  judge needs in its `system_prompt`.
+  You must define every evaluator yourself, including all of the context that the judge needs in its `system_prompt`.
+
+You can also set the **`judge_model`** on an evaluator to use a different model. The default judge model is `openai/gpt-5.4-mini`.
+
 </Note>
 
-| Key             | Type    | Description                                                                                                          |
-| --------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string  | A short name (used in results and leaderboard columns)                                                               |
+| Key             | Type    | Description                                                                                                           |
+| --------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `name`          | string  | A short name (used in results and leaderboard columns)                                                                |
 | `system_prompt` | string  | Full system prompt for this evaluator's LLM judge call. Include any agent-context the judge needs to score correctly. |
-| `judge_model`   | string  | OpenRouter model id for this evaluator (default: `openai/gpt-5.2`)                                                  |
-| `type`          | string  | `"binary"` (default) or `"rating"`                                                                                  |
-| `scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                                           |
-| `scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                                          |
+| `judge_model`   | string  | OpenRouter model id for this evaluator (default: `openai/gpt-5.4-mini`)                                               |
+| `type`          | string  | `"binary"` (default) or `"rating"`                                                                                    |
+| `scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                                             |
+| `scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                                            |
 
 ```json
 {
@@ -105,19 +106,36 @@ An array of LLM judges used to evaluate the agent's performance. Each evaluator 
     {
       "name": "tool_usage",
       "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a customer support assistant for an online store) and a simulated user. You will be given the chat history of the conversation. Mark True if the agent called the `log_inquiry` tool with the correct `inquiry_type` and `order_id` whenever the customer provided one.",
-      "judge_model": "openai/gpt-5.2"
+      "judge_model": "openai/gpt-5.4-mini"
     },
     {
       "name": "helpfulness",
       "system_prompt": "You are a highly accurate evaluator assessing a conversation between a customer support agent and a simulated user. You will be given the chat history of the conversation. Rate the agent's helpfulness on a 1-5 scale: 1 (unhelpful, confused), 3 (somewhat helpful), 5 (clearly resolved the customer's need).",
-      "judge_model": "openai/gpt-5.2",
+      "judge_model": "openai/gpt-5.4-mini",
       "type": "rating",
       "scale_min": 1,
       "scale_max": 5
+    },
+    {
+      "name": "goal_completion",
+      "system_prompt": "You are a highly accurate evaluator.\n\nYou will be given a conversation between a user and an agent. Evaluate whether the agent successfully helped the user achieve their goal by the end of the conversation.\n\nEvaluation criteria:\n- The user's primary goal or request must be fully addressed.\n- Partial completion or unresolved follow-ups count as not completed.\n- If the user's goal is unclear, judge based on whether the agent made reasonable progress toward what was asked.\n\nMark True if the goal was fully achieved; False otherwise.\n\nAlways give your reasoning in english irrespective of the language of the conversation."
+    },
+    {
+      "name": "empathy_tone",
+      "system_prompt": "You are a highly accurate evaluator.\n\nYou will be given a conversation between a user and an agent. Rate how empathetic and appropriate the agent's tone was throughout the conversation.\n\nEvaluation criteria:\n- Did the agent acknowledge the user's emotions or concerns?\n- Was the tone polite, respectful, and contextually appropriate?\n- Did the agent avoid being dismissive, condescending, or curt?\n\nRespond with an integer score from 1 to 5, where:\n1 = rude, distant, dismissive, or hostile\n2 = cold or unhelpful\n3 = neutral — acceptable but not warm\n4 = friendly and considerate\n5 = consistently highly empathetic and emotionally aware\n\nAlways give your reasoning in english irrespective of the language of the conversation.",
+      "type": "rating",
+      "scale_min": 1,
+      "scale_max": 5
+    },
+    {
+      "name": "persona_adherence",
+      "system_prompt": "You are a highly accurate evaluator.\n\nYou will be given a conversation between a user and an agent that has been assigned a specific role or persona. Evaluate whether the agent stayed consistently in role throughout the conversation.\n\nEvaluation criteria:\n- The agent should not break character or reveal that it is an AI/LLM unless explicitly asked.\n- The agent should consistently behave in line with its assigned role, scope, and tone.\n- Acknowledging limitations within the role is fine; explicitly stepping outside the role is not.\n\nMark True if the agent stayed in role throughout; False otherwise.\n\nAlways give your reasoning in english irrespective of the language of the conversation."
     }
   ]
 }
 ```
+
+Paste the `evaluators` array next to `system_prompt`, `personas`, `scenarios`, and your other top-level keys in your simulation config JSON.
 
 Binary evaluators produce pass/fail and appear as pass-rate percentages in the leaderboard. Rating evaluators produce an integer score on the scale you define and appear as mean scores in the leaderboard.
 
@@ -162,7 +180,7 @@ For voice simulations, specify the STT, LLM, and TTS providers:
 
 <AccordionGroup>
   <Accordion title="Calibrate agent example">
-    See the [full text simulation file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/tree/main/examples/agent/simulation/sample_text_internal_agent.json) and the [full voice simulation file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/tree/main/examples/agent/simulation/sample_voice.json).
+    See the [full text simulation file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/tree/main/examples/agent/simulation/sample_text_internal_agent.json) and the [full voice simulation file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/tree/main/examples/agent/simulation/sample_voice.json). The snippet below matches the **text** setup; voice runs add **`stt`**, **`tts`**, and **`llm`** (with **`model`**) and may set **`interruption_sensitivity`** on personas — see the voice sample for those keys.
 
     ```json
     {
@@ -186,13 +204,21 @@ For voice simulations, specify the STT, LLM, and TTS providers:
         {
           "name": "tool_usage",
           "system_prompt": "You are a highly accurate evaluator assessing a conversation between an agent (a customer support assistant for an online store) and a simulated user. You will be given the chat history of the conversation. Mark True if the agent called the `log_inquiry` tool with the correct `inquiry_type` and `order_id` whenever the customer provided one.",
-          "judge_model": "openai/gpt-5.2"
+          "judge_model": "openai/gpt-5.4-mini"
         }
       ],
       "settings": {
         "agent_speaks_first": true,
         "max_turns": 5
       }
+    }
+    ```
+
+    ```json
+    {
+      "stt": { "provider": "sarvam" },
+      "tts": { "provider": "cartesia" },
+      "llm": { "model": "google/gemini-3-flash-preview" }
     }
     ```
 

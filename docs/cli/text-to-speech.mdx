@@ -40,7 +40,7 @@ The evaluation runs providers in parallel (max 2 at a time), showing the progres
 
 ## Evaluator configuration
 
-By default, an audio LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether each synthesized audio matches the reference text. The judge sends the audio as a base64-encoded `input_audio` block, supported via [OpenRouter's multimodal audio API](https://openrouter.ai/docs/guides/overview/multimodal/audio). You can customize the judge model and add multiple evaluators by passing an optional config file with `--config`:
+By default, an audio LLM judge — routed through [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY` in your environment) — evaluates whether the reference text is pronounced correctly in the synthesized audio using the built-in **`pronunciation`** evaluator; expand **Default evaluator: pronunciation** below for the exact `system_prompt` from the codebase. You can customize the judge model and add multiple evaluators by passing an optional config file with `--config`:
 
 ```bash
 calibrate tts -p openai google -i sample.csv -o ./out --config config.json
@@ -56,31 +56,31 @@ The config file supports:
     {
       "name": "intelligibility",
       "system_prompt": "You are a highly accurate evaluator. You will be given an audio sample and the reference text it is supposed to speak. Mark True if the spoken text is clearly understandable from the audio.",
-      "judge_model": "openai/gpt-4o-audio-preview"
+      "judge_model": "openai/gpt-audio"
     },
     {
       "name": "pronunciation",
       "system_prompt": "You are a highly accurate evaluator. You will be given an audio sample and the reference text it is supposed to speak. Mark True only if all words are pronounced correctly with natural-sounding speech.",
-      "judge_model": "openai/gpt-4o-audio-preview"
+      "judge_model": "openai/gpt-audio"
     }
   ]
 }
 ```
 
-| Key                          | Type   | Description                                                                                |
-| ---------------------------- | ------ | ------------------------------------------------------------------------------------------ |
-| `evaluators`                 | array  | List of evaluators. Each one becomes its own audio LLM call per row.                       |
-| `evaluators[].name`          | string | Unique evaluator name. Becomes the column name in the leaderboard.                         |
-| `evaluators[].system_prompt` | string | Full system prompt used for this evaluator's audio LLM judge call.                         |
-| `evaluators[].judge_model`   | string | OpenRouter model id for this evaluator (default: `openai/gpt-4o-audio-preview`). Must be an audio-capable model in the [OpenRouter catalog](https://openrouter.ai/models). |
+| Key                          | Type   | Description                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `evaluators`                 | array  | List of evaluators. Each one becomes its own audio LLM call per row.                                                                                                                                                                                                                                                                                                                |
+| `evaluators[].name`          | string | Unique evaluator name. Becomes the column name in the leaderboard.                                                                                                                                                                                                                                                                                                                  |
+| `evaluators[].system_prompt` | string | Full system prompt used for this evaluator's audio LLM judge call.                                                                                                                                                                                                                                                                                                                  |
+| `evaluators[].judge_model`   | string | OpenRouter model id for this evaluator (default: `openai/gpt-audio`). Must be an audio-capable model in the [OpenRouter catalog](https://openrouter.ai/models) — for example OpenAI’s audio models or Google’s Gemini audio-capable entries; the [sample config](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/tts/config.json) uses `google/gemini-2.5-flash`. |
 
 Each evaluator also accepts:
 
-| Key         | Type    | Description                                                            |
-| ----------- | ------- | ---------------------------------------------------------------------- |
-| `type`      | string  | `"binary"` (default) or `"rating"`                                     |
-| `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.              |
-| `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score.             |
+| Key         | Type    | Description                                                |
+| ----------- | ------- | ---------------------------------------------------------- |
+| `type`      | string  | `"binary"` (default) or `"rating"`                         |
+| `scale_min` | integer | Required when `type` is `"rating"`. Lowest allowed score.  |
+| `scale_max` | integer | Required when `type` is `"rating"`. Highest allowed score. |
 
 Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluators produce an integer score on your scale and a mean score in the leaderboard.
 
@@ -89,8 +89,25 @@ When multiple evaluators are defined, each is scored independently — one audio
 Refer to the [sample config](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/tts/config.json) for a template.
 
 <Note>
-  The `--config` flag is optional. When omitted, a single built-in `pronunciation` evaluator scores audio intelligibility. The TTS judge requires an audio-capable model.
+  The `--config` flag is optional. When omitted, a single built-in
+  `pronunciation` evaluator scores audio intelligibility. The TTS judge requires
+  an audio-capable model.
 </Note>
+
+<AccordionGroup>
+  <Accordion title="pronunciation (default evaluator system prompt)">
+    Matches [`DEFAULT_TTS_EVALUATOR`](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/calibrate/judges.py) in `calibrate/judges.py` when no `--config` is passed.
+
+    ```text
+    You are a highly accurate evaluator evaluating the audio output of a TTS model.
+
+    You will be given the audio and the text that should have been spoken in the audio.
+
+    You need to evaluate if the text is easily understandable from the audio. Check whether the spoken words match the reference text and the audio is clear enough to convey the intended message.
+    ```
+
+  </Accordion>
+</AccordionGroup>
 
 ## Output
 

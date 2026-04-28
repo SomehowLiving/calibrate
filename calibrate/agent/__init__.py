@@ -120,8 +120,11 @@ class _Simulation:
             ...     llm=LLMConfig(provider="openrouter", model="openai/gpt-4.1"),
             ... ))
         """
+        from calibrate.judges import require_simulation_evaluators
         from calibrate.agent.run_simulation import run_single_simulation_task
         import gc
+
+        require_simulation_evaluators(evaluators)
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -131,7 +134,7 @@ class _Simulation:
             "tools": tools,
             "personas": personas,
             "scenarios": scenarios,
-            "evaluators": evaluators or [],
+            "evaluators": evaluators,
             "settings": {
                 "agent_speaks_first": agent_speaks_first,
                 "max_turns": max_turns,
@@ -312,13 +315,16 @@ class _Simulation:
             ...     output_dir="./out"
             ... ))
         """
+        from calibrate.judges import require_simulation_evaluators
         from calibrate.agent.run_simulation import run_simulation as _run_simulation
+
+        require_simulation_evaluators(evaluators)
 
         return await _run_simulation(
             system_prompt=system_prompt,
             language=language,
             gender=gender,
-            evaluators=evaluators or [],
+            evaluators=evaluators,
             output_dir=output_dir,
             interrupt_probability=interrupt_probability,
             port=port,

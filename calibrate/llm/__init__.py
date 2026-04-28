@@ -527,7 +527,10 @@ class _Simulations:
                 a model-specific subfolder. Used by the single-model path in run()
                 for backward compatibility.
         """
+        from calibrate.judges import require_simulation_evaluators
         from calibrate.llm.run_simulation import run_single_simulation_task
+
+        require_simulation_evaluators(evaluators or [])
 
         # Create output directory — flat for single-model runs, model-scoped for benchmarks
         if _flat_output:
@@ -673,8 +676,7 @@ class _Simulations:
             scenarios: List of scenario dicts with 'description'
             evaluators: List of evaluator dicts with 'name', 'system_prompt',
                 'judge_model', and optional 'type'/'scale_min'/'scale_max'.
-                Simulation has no implicit default — pass an empty list to
-                skip judging entirely.
+                At least one evaluator is required (simulations have no implicit default).
             system_prompt: System prompt for the bot/agent (ignored when agent is provided)
             tools: List of tool definitions available to the agent (ignored when agent is provided)
             output_dir: Path to output directory for results (default: ./out)
@@ -808,8 +810,7 @@ class _Simulations:
         Args:
             personas: List of persona dicts with 'characteristics', 'gender', 'language'
             scenarios: List of scenario dicts with 'description'
-            evaluators: List of evaluator dicts (top-level). Pass empty list
-                to skip judging.
+            evaluators: List of evaluator dicts (top-level); at least one is required.
             system_prompt: System prompt for the bot/agent (ignored when agent is provided)
             tools: List of tool definitions available to the agent (ignored when agent is provided)
             output_dir: Path to output directory for results (default: ./out)
@@ -876,8 +877,7 @@ class _Simulations:
             bot_system_prompt: System prompt for the bot/agent
             tools: List of tool definitions available to the bot
             user_system_prompt: System prompt for the simulated user
-            evaluators: List of evaluator dicts (top-level). Pass empty list
-                to skip judging.
+            evaluators: List of evaluator dicts (top-level); at least one is required.
             bot_model: Model name for the bot
             user_model: Model name for the simulated user
             bot_provider: LLM provider for the bot

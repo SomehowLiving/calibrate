@@ -38,6 +38,7 @@ from calibrate.judges import (
     evaluator_result_value,
     format_evaluation_result_lines,
     is_rating,
+    require_simulation_evaluators,
 )
 import pandas as pd
 
@@ -838,6 +839,8 @@ async def run_simulation(
     fallback_judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
     fallback_stt_judge_model: str = DEFAULT_STT_JUDGE_MODEL,
 ) -> dict:
+    require_simulation_evaluators(evaluators)
+
     # Set context for EVAL logs
     current_context.set("EVAL")
 
@@ -1663,6 +1666,12 @@ async def main():
 
     with open(args.config, "r") as f:
         config = json.load(f)
+
+    try:
+        require_simulation_evaluators(config.get("evaluators"))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
 

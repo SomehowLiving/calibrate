@@ -538,6 +538,20 @@ def format_conversation(conversation: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def require_simulation_evaluators(evaluators: object) -> None:
+    """Raise ``ValueError`` unless ``evaluators`` is a non-empty list.
+
+    Text and voice simulations do not inject implicit judges; config and SDK
+    callers must provide at least one evaluator.
+    """
+
+    if not isinstance(evaluators, list) or len(evaluators) == 0:
+        raise ValueError(
+            "Simulation config must define a non-empty top-level `evaluators` "
+            "(simulations have no implicit default)."
+        )
+
+
 # ── Simulation judge (thin wrapper over text_judge) ─────────────────────────
 
 

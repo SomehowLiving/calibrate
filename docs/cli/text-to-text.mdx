@@ -1,12 +1,12 @@
 ---
-title: "LLM Evaluation"
+title: "LLM tests"
 description: "Create edge cases to test the LLM powering your agent"
 ---
 
 <iframe
   className="w-full aspect-video rounded-xl"
   src="https://www.youtube.com/embed/OQfmkkU9Fj0"
-  title="CLI LLM Evaluation Walkthrough"
+  title="CLI LLM tests Walkthrough"
   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
   allowFullScreen
 ></iframe>
@@ -128,14 +128,15 @@ An array of test cases to evaluate your agent on. Each test case has:
 
 **Tool call test** — verifies the agent calls the correct tool with expected arguments:
 
-```json
+```jsonc
 {
+  // tool_call test
   "history": [
     { "role": "assistant", "content": "Hello! How can I help you today?" },
     {
       "role": "user",
-      "content": "I want to check my order status. My order ID is ORD-12345."
-    }
+      "content": "I want to check my order status. My order ID is ORD-12345.",
+    },
   ],
   "evaluation": {
     "type": "tool_call",
@@ -143,11 +144,11 @@ An array of test cases to evaluate your agent on. Each test case has:
       {
         "tool": "check_order",
         "arguments": {
-          "order_id": "ORD-12345"
-        }
-      }
-    ]
-  }
+          "order_id": "ORD-12345",
+        },
+      },
+    ],
+  },
 }
 ```
 
@@ -158,16 +159,17 @@ An array of test cases to evaluate your agent on. Each test case has:
 
 **Response test** — verifies the agent's response meets the criteria defined (evaluated by an LLM judge):
 
-```json
+```jsonc
 {
+  // response test — implicit default correctness evaluator (string criteria)
   "history": [
     { "role": "assistant", "content": "Hello! How can I help you today?" },
-    { "role": "user", "content": "What's the weather like?" }
+    { "role": "user", "content": "What's the weather like?" },
   ],
   "evaluation": {
     "type": "response",
-    "criteria": "The assistant should politely redirect the conversation back to store-related topics."
-  }
+    "criteria": "The assistant should politely redirect the conversation back to store-related topics.",
+  },
 }
 ```
 
@@ -175,30 +177,17 @@ For agent connection, your agent owns its tools internally — there is no need 
 
 ---
 
-## Evaluator configuration
+## Evaluators
 
-Response-type test cases are evaluated by a text LLM judge that routes through [OpenRouter](https://openrouter.ai/) — set `OPENROUTER_API_KEY` in your environment.
+**Response** test cases can be evaluated by one or more text LLM judges (routed through [OpenRouter](https://openrouter.ai/), set `OPENROUTER_API_KEY` in your environment).
 
-Each evaluator's `system_prompt` is sent as the system message to its own dedicated LLM judge call (one call per evaluator, run in parallel). The user message contains the conversation history and the agent's response.
-
-### Quick start: single criterion
-
-The simplest setup needs no top-level `evaluators`. Pass `criteria` as a string and the implicit `correctness` evaluator runs. The string is substituted into the default evaluator's system prompt as the `{{criteria}}` variable:
-
-```json
-{
-  "evaluation": {
-    "type": "response",
-    "criteria": "The assistant should politely redirect to store-related topics."
-  }
-}
-```
+Each evaluator's `system_prompt` is sent to its own dedicated LLM judge call (one call per evaluator, run in parallel) with the conversation history and the agent's last response as the inputs.
 
 ### Defining custom evaluators
 
 Define one or more evaluators at the top level and reference them by name from each test case. Each evaluator is an independent LLM call and produces its own column in the leaderboard:
 
-```json
+```jsonc
 {
   "evaluators": [
     {
@@ -217,6 +206,7 @@ Define one or more evaluators at the top level and reference them by name from e
   ],
   "test_cases": [
     {
+      // response — custom named evaluators (accuracy + tone)
       "history": [...],
       "evaluation": {
         "type": "response",
@@ -230,21 +220,52 @@ Define one or more evaluators at the top level and reference them by name from e
 }
 ```
 
-| Key                          | Type   | Description                                                                                |
-| ---------------------------- | ------ | ------------------------------------------------------------------------------------------ |
-| `evaluators`                 | array  | Top-level list of evaluators. Each one becomes its own LLM call per test case.             |
-| `evaluators[].name`          | string | Unique evaluator name. Test cases reference it via `evaluation.criteria[].name`.           |
-| `evaluators[].system_prompt` | string | Full system prompt for this evaluator. Supports `{{var}}` placeholders that are substituted from the test case's `arguments`. |
-| `evaluators[].judge_model`   | string | OpenRouter model id for this evaluator (default: `openai/gpt-4.1`).                        |
-| `evaluators[].type`          | string | `"binary"` (default) or `"rating"`.                                                        |
-| `evaluators[].scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                 |
-| `evaluators[].scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                |
+### Using the default evaluator
+
+The simplest setup needs no top-level `evaluators`. Pass `criteria` as a string and the implicit `correctness` evaluator runs. The string is substituted into the default evaluator's system prompt as the `{{criteria}}` variable:
+
+```jsonc
+{
+  // response — implicit default correctness evaluator (string criteria only)
+  "evaluation": {
+    "type": "response",
+    "criteria": "The assistant should politely redirect to store-related topics.",
+  },
+}
+```
+
+<AccordionGroup>
+  <Accordion title="correctness (default evaluator system prompt)">
+    When you omit top-level `evaluators` and pass a string `criteria`, this is the implicit evaluator from [`DEFAULT_LLM_TEST_EVALUATOR`](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/calibrate/judges.py) that is used by default. Your `criteria` string is substituted for `{{criteria}}`.
+
+    ```text
+    You are a highly accurate evaluator evaluating the response of an agent to a user's message.
+
+    You will be given a conversation between a user and an agent along with the response of the agent to the final user message.
+
+    You need to evaluate if the response adheres to the evaluation criteria:
+
+    {{criteria}}
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+| Key                          | Type    | Description                                                                                                                        |
+| ---------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `evaluators`                 | array   | Top-level list of evaluators. Each one becomes its own LLM call per test case.                                                     |
+| `evaluators[].name`          | string  | Unique evaluator name. Test cases reference it via `evaluation.criteria[].name`.                                                   |
+| `evaluators[].system_prompt` | string  | Full system prompt for this evaluator. Supports `{{variable}}` placeholders that are substituted from the test case's `arguments`. |
+| `evaluators[].judge_model`   | string  | OpenRouter model id for this evaluator (default: `openai/gpt-5.4-mini`).                                                           |
+| `evaluators[].type`          | string  | `"binary"` (default) or `"rating"`.                                                                                                |
+| `evaluators[].scale_min`     | integer | Required when `type` is `"rating"`. Lowest allowed score.                                                                          |
+| `evaluators[].scale_max`     | integer | Required when `type` is `"rating"`. Highest allowed score.                                                                         |
 
 ### Variable substitution
 
-A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in the evaluator's `system_prompt` is replaced with the matching value before the judge call:
+A test case can pass `arguments` to an evaluator. Each `{{variable}}` placeholder in the evaluator's `system_prompt` is replaced with the matching value before the judge call:
 
-```json
+```jsonc
 {
   "evaluators": [
     {
@@ -255,6 +276,7 @@ A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in 
   ],
   "test_cases": [
     {
+      // response — custom correctness evaluator with {{criteria}} substituted from arguments
       "history": [...],
       "evaluation": {
         "type": "response",
@@ -267,17 +289,15 @@ A test case can pass `arguments` to an evaluator. Each `{{var}}` placeholder in 
 }
 ```
 
-The string-form `criteria` (shown in the quick start above) is just a shortcut for the implicit `correctness` evaluator with `{ "arguments": { "criteria": "<your string>" } }`.
+The string-form `criteria` (shown in the quickstart above) is just a shortcut for the implicit `correctness` evaluator with `{ "arguments": { "criteria": "<your string>" } }`.
 
 ### Binary vs rating
 
-Binary evaluators produce per-row pass/fail and a mean pass-rate. Rating evaluators produce an integer score on your scale and a mean score in the leaderboard.
+Binary evaluators produce per-row pass/fail and a mean pass-rate in aggregates. Rating evaluators report **mean/min/max** scores per model on the leaderboard.
 
-A test case passes only when **all** binary evaluators match. Rating evaluators are **informational** — they produce a mean score per model but don't affect pass/fail. Use a binary evaluator like `"is the tone rating at least 4?"` if you want to gate on a score.
+At **test-case pass/fail** time, **every referenced evaluator must pass**: binary evaluators require `match: true`, and rating evaluators require the numeric **`score` to equal `scale_max`** (anything lower fails that evaluator). So on a 1–5 scale (`scale_min` 1, `scale_max` 5), only a judge score of **5** counts as pass — intermediate scores fail unless they hit the top of your declared scale.
 
-<Note>
-  The `evaluators` key is optional. When omitted, the implicit `correctness` evaluator is used and `criteria` may be passed as a plain string.
-</Note>
+If you want thresholds different from “top-of-scale” (for example “tone at least 4”), encode that as a **binary** evaluator whose `system_prompt` asks the judge explicitly (for example: “Mark True if and only if tone is at least 4 on a 1–5 scale”).
 
 ---
 
@@ -285,27 +305,27 @@ A test case passes only when **all** binary evaluators match. Rating evaluators 
 
 <AccordionGroup>
   <Accordion title="Calibrate agent example">
-    See the [full file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/llm/config-internal-agent.json).
+    Same structure as [`examples/llm/config-internal-agent.json`](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/llm/config-internal-agent.json), with documentation-only `//` comments before each test case (`jsonc` — strip comments if you paste into a strict JSON parser).
 
-    ```json
+    ```jsonc
     {
-      "system_prompt": "You are a helpful customer support assistant...",
+      "system_prompt": "You are a helpful customer support assistant for an online store.\n\nYou help customers with:\n1. Checking order status\n2. Processing returns\n3. Answering product questions\n\nWhen a customer asks about their order, call the `check_order` webhook tool with their order ID to fetch the status.\n\nWhen a customer provides feedback or sentiment during the conversation, call the `log_interaction` tool to record the interaction type and sentiment.\n\nBe friendly, helpful, and concise in your responses.",
       "tools": [
         {
           "type": "client",
           "name": "log_interaction",
-          "description": "Log customer interaction details",
+          "description": "Log customer interaction details including the type of inquiry and customer sentiment",
           "parameters": [
             {
               "id": "interaction_type",
               "type": "string",
-              "description": "Type of interaction",
+              "description": "Type of customer interaction: order_inquiry, return_request, product_question, complaint, or general",
               "required": true
             },
             {
               "id": "sentiment",
               "type": "string",
-              "description": "Customer sentiment",
+              "description": "Customer sentiment: positive, neutral, or negative",
               "required": true
             }
           ]
@@ -313,13 +333,13 @@ A test case passes only when **all** binary evaluators match. Rating evaluators 
         {
           "type": "webhook",
           "name": "check_order",
-          "description": "Check the status of a customer order",
-          "parameters": [],
+          "description": "Check the status of a customer order by order ID",
+          "parameters": [ ],
           "webhook": {
             "method": "GET",
             "url": "https://api.example.com/orders",
             "timeout": 10,
-            "headers": [{ "name": "Authorization", "value": "Bearer API_KEY" }],
+            "headers": [ { "name": "Authorization", "value": "Bearer API_KEY" } ],
             "queryParameters": [
               {
                 "id": "order_id",
@@ -331,27 +351,107 @@ A test case passes only when **all** binary evaluators match. Rating evaluators 
           }
         }
       ],
+      "evaluators": [
+        {
+          "name": "relevance",
+          "system_prompt": "You are a highly accurate evaluator evaluating the response to a conversation.\n\nYou will be given a conversation between a user and a human agent along with the response of the human agent to the final user message.\n\nMark True if the assistant's response is about product availability or asks for more details about the laptop.",
+          "judge_model": "openai/gpt-4.1"
+        },
+        {
+          "name": "tone",
+          "system_prompt": "You are a highly accurate evaluator evaluating the response to a conversation.\n\nYou will be given a conversation between a user and a human agent along with the response of the human agent to the final user message.\n\nRate the tone on a 1-5 scale: 1 = rude/robotic, 3 = neutral, 5 = warm and helpful.",
+          "judge_model": "openai/gpt-4.1",
+          "type": "rating",
+          "scale_min": 1,
+          "scale_max": 5
+        }
+      ],
       "test_cases": [
         {
+          // tool_call — expect check_order (webhook)
           "history": [
-            { "role": "assistant", "content": "Hello! How can I help you today?" },
-            { "role": "user", "content": "Check order ORD-12345" }
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "I want to check my order status. My order ID is ORD-12345."
+            }
           ],
           "evaluation": {
             "type": "tool_call",
             "tool_calls": [
-              { "tool": "check_order", "arguments": { "order_id": "ORD-12345" } }
+              {
+                "tool": "check_order",
+                "arguments": { "query": {
+                    "order_id": "ORD-12345"
+                  }
+                }
+              }
             ]
           }
         },
         {
+          // tool_call — expect log_interaction (client tool)
           "history": [
-            { "role": "assistant", "content": "Hello! How can I help you today?" },
-            { "role": "user", "content": "What's the weather like?" }
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "I'm really happy with my recent purchase! The product quality is amazing."
+            }
+          ],
+          "evaluation": {
+            "type": "tool_call",
+            "tool_calls": [
+              {
+                "tool": "log_interaction",
+                "arguments": {
+                  "interaction_type": "general",
+                  "sentiment": "positive"
+                }
+              }
+            ]
+          }
+        },
+        {
+          // response — implicit default correctness evaluator (string criteria); independent of named evaluators below
+          "history": [
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "What's the weather like?"
+            }
           ],
           "evaluation": {
             "type": "response",
-            "criteria": "The assistant should politely redirect to store-related topics."
+            "criteria": "The assistant should politely redirect the conversation back to store-related topics and explain it can only help with order inquiries, returns, and product questions."
+          }
+        },
+        {
+          // response — custom named evaluators (relevance + tone from top-level evaluators)
+          "history": [
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "Do you have any laptops in stock?"
+            }
+          ],
+          "evaluation": {
+            "type": "response",
+            "criteria": [
+              { "name": "relevance" },
+              { "name": "tone" }
+            ]
           }
         }
       ]
@@ -361,9 +461,9 @@ A test case passes only when **all** binary evaluators match. Rating evaluators 
   </Accordion>
 
   <Accordion title="Agent connection example">
-    See the [full file on GitHub](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/llm/config-external-agent.json).
+    Same structure as [`examples/llm/config-external-agent.json`](https://github.com/ARTPARK-SAHAI-ORG/calibrate/blob/main/examples/llm/config-external-agent.json), with documentation-only `//` comments before each test case (`jsonc` — strip comments if you paste into a strict JSON parser).
 
-    ```json
+    ```jsonc
     {
       "agent_url": "https://your-agent.com/chat",
       "agent_headers": {
@@ -371,25 +471,86 @@ A test case passes only when **all** binary evaluators match. Rating evaluators 
       },
       "test_cases": [
         {
+          // tool_call — expect check_order
           "history": [
-            { "role": "assistant", "content": "Hello! How can I help you today?" },
-            { "role": "user", "content": "Check order ORD-12345" }
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "I want to check my order status. My order ID is ORD-12345."
+            }
           ],
           "evaluation": {
             "type": "tool_call",
             "tool_calls": [
-              { "tool": "check_order", "arguments": { "order_id": "ORD-12345" } }
+              {
+                "tool": "check_order",
+                "arguments": {
+                  "order_id": "ORD-12345"
+                }
+              }
             ]
           }
         },
         {
+          // tool_call — expect log_interaction
           "history": [
-            { "role": "assistant", "content": "Hello! How can I help you today?" },
-            { "role": "user", "content": "What's the weather like?" }
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "I'm really happy with my recent purchase! The product quality is amazing."
+            }
+          ],
+          "evaluation": {
+            "type": "tool_call",
+            "tool_calls": [
+              {
+                "tool": "log_interaction",
+                "arguments": {
+                  "interaction_type": "general",
+                  "sentiment": "positive"
+                }
+              }
+            ]
+          }
+        },
+        {
+          // response — implicit default correctness evaluator (string criteria)
+          "history": [
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "What's the weather like?"
+            }
           ],
           "evaluation": {
             "type": "response",
-            "criteria": "The assistant should politely redirect to store-related topics."
+            "criteria": "The assistant should politely redirect the conversation back to store-related topics and explain it can only help with order inquiries, returns, and product questions."
+          }
+        },
+        {
+          // response — implicit default correctness evaluator (string criteria)
+          "history": [
+            {
+              "role": "assistant",
+              "content": "Hello! How can I help you today?"
+            },
+            {
+              "role": "user",
+              "content": "Do you have any laptops in stock?"
+            }
+          ],
+          "evaluation": {
+            "type": "response",
+            "criteria": "The assistant should respond helpfully about product availability or ask for more details about what specific laptop the customer is looking for."
           }
         }
       ]
@@ -442,8 +603,6 @@ _Benchmark across models:_
 6. **API keys** — only `OPENAI_API_KEY` is required (used by the LLM judge)
 
 ### Non-interactive mode
-
-Pass a config file directly to skip the UI.
 
 **Calibrate agent:**
 
@@ -509,13 +668,6 @@ Once all the models have completed, it displays a leaderboard with pass rates (%
 </Frame>
 
 You can drill into each model to view the results for each test with the reasoning behind the pass/fail status.
-
-<Frame>
-  <img
-    src="./images/llm_model_output_fail.png"
-    alt="LLM model outputs (fail)"
-  />
-</Frame>
 
 <Frame>
   <img
