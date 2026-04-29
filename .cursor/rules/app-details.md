@@ -347,8 +347,8 @@ Full end-to-end voice pipeline testing with STT, LLM, and TTS components.
 ```
 simulation_persona_N_scenario_M/
 ├── audios/
-│   ├── 0_user.wav
 │   ├── 1_bot.wav
+│   ├── 2_user.wav
 │   └── ...
 ├── transcript.json
 ├── evaluation_results.csv   # Includes latency metrics + STT judge
@@ -1296,7 +1296,7 @@ Config builder functions (`buildTestsConfig`, `buildTextSimConfig`, `buildVoiceS
 
 - All audio must be WAV format
 - STT input audio should match the file names in `stt.csv`
-- Voice simulation audio uses 1-based indexing: `1_user.wav`, `1_bot.wav`, etc.
+- Voice simulation audio uses a single 1-based index that matches transcript order across speakers: `1_bot.wav`, `2_user.wav`, `3_bot.wav`, `4_user.wav`, etc.
 
 ### Provider-Specific
 

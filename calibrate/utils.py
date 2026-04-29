@@ -484,10 +484,10 @@ def combine_audio_files(
 
     Uses the transcript to determine the correct order of audio files.
     For each content message in the transcript (skipping tool_calls-only messages),
-    the corresponding audio file is added in order:
-      - assistant content messages map to {N}_bot.wav (N = 1, 2, 3, ...)
-      - user content messages map to {N}_user.wav (N = 1, 2, 3, ...)
-    Bot and user indices are tracked separately.
+    the corresponding audio file is added in order using a single 1-based line
+    index ``N`` that matches ``transcript.json`` order:
+      - ``assistant`` content → ``{N}_bot.wav``
+      - ``user`` content → ``{N}_user.wav``
 
     Falls back to sorting by filename if no transcript is provided.
 
@@ -515,8 +515,7 @@ def combine_audio_files(
     with open(transcript_path, "r") as f:
         transcript = json.load(f)
 
-    bot_index = 1
-    user_index = 1
+    msg_index = 1
 
     for msg in transcript:
         # Skip messages that only have tool_calls and no content
@@ -525,19 +524,19 @@ def combine_audio_files(
 
         role = msg.get("role")
         if role == "assistant":
-            file_path = os.path.join(audio_dir, f"{bot_index}_bot.wav")
+            file_path = os.path.join(audio_dir, f"{msg_index}_bot.wav")
             if os.path.exists(file_path):
                 sorted_files.append(file_path)
             else:
                 logger.warning(f"Expected audio file not found: {file_path}")
-            bot_index += 1
+            msg_index += 1
         elif role == "user":
-            file_path = os.path.join(audio_dir, f"{user_index}_user.wav")
+            file_path = os.path.join(audio_dir, f"{msg_index}_user.wav")
             if os.path.exists(file_path):
                 sorted_files.append(file_path)
             else:
                 logger.warning(f"Expected audio file not found: {file_path}")
-            user_index += 1
+            msg_index += 1
 
     if not sorted_files:
         raise ValueError("No audio files matched from transcript")
