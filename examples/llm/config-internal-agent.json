@@ -56,6 +56,12 @@
       "type": "rating",
       "scale_min": 1,
       "scale_max": 5
+    },
+    {
+      "id": "topic-focus-id",
+      "name": "topic_focus",
+      "system_prompt": "You are a highly accurate evaluator evaluating the response to a conversation.\n\nYou will be given a conversation between a user and a human agent along with the response of the human agent to the final user message.\n\nMark True only if the assistant's response stays focused on the topic '{{expected_topic}}' and does not drift to unrelated subjects. The expected language for the response is {{expected_language}}.",
+      "judge_model": "openai/gpt-4.1"
     }
   ],
   "test_cases": [

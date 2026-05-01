@@ -1,0 +1,166 @@
+[
+    {
+        "test_case": {
+            "id": "test-tool-call-1",
+            "history": [
+                {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                {
+                    "role": "user",
+                    "content": "I want to check my order status. My order ID is ORD-12345."
+                }
+            ],
+            "evaluation": {
+                "type": "tool_call",
+                "tool_calls": [
+                    {
+                        "tool": "check_order",
+                        "arguments": {
+                            "query": {
+                                "order_id": "ORD-12345"
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "output": {
+            "response": "",
+            "tool_calls": [
+                {
+                    "tool": "check_order",
+                    "arguments": {
+                        "query": {
+                            "order_id": "ORD-12345"
+                        }
+                    }
+                }
+            ]
+        }
+    },
+    {
+        "test_case": {
+            "id": "test-tool-call-2",
+            "history": [
+                {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                {
+                    "role": "user",
+                    "content": "I'm really happy with my recent purchase! The product quality is amazing."
+                }
+            ],
+            "evaluation": {
+                "type": "tool_call",
+                "tool_calls": [
+                    {
+                        "tool": "log_interaction",
+                        "arguments": {
+                            "interaction_type": "general",
+                            "sentiment": "positive"
+                        }
+                    }
+                ]
+            }
+        },
+        "output": {
+            "response": "Wonderful — I'm glad you're enjoying it! I'll make a note of that.",
+            "tool_calls": [
+                {
+                    "tool": "log_interaction",
+                    "arguments": {
+                        "interaction_type": "general",
+                        "sentiment": "positive"
+                    }
+                }
+            ]
+        }
+    },
+    {
+        "test_case": {
+            "id": "test-response-1",
+            "history": [
+                {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                {
+                    "role": "user",
+                    "content": "What's the weather like?"
+                }
+            ],
+            "evaluation": {
+                "type": "response",
+                "criteria": "The assistant should politely redirect the conversation back to store-related topics and explain it can only help with order inquiries, returns, and product questions."
+            }
+        },
+        "output": {
+            "response": "I'm not able to help with the weather, but I can assist with order inquiries, returns, or product questions. Is there something along those lines I can help you with?",
+            "tool_calls": []
+        }
+    },
+    {
+        "test_case": {
+            "id": "test-response-2",
+            "history": [
+                {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                {
+                    "role": "user",
+                    "content": "Do you have any laptops in stock?"
+                }
+            ],
+            "evaluation": {
+                "type": "response",
+                "criteria": [
+                    {
+                        "name": "relevance"
+                    },
+                    {
+                        "name": "tone"
+                    }
+                ]
+            }
+        },
+        "output": {
+            "response": "We do carry laptops! Could you share a bit about what you're looking for — preferred screen size, intended use, or budget — so I can point you to the right options?",
+            "tool_calls": []
+        }
+    },
+    {
+        "test_case": {
+            "id": "test-response-3-with-vars",
+            "history": [
+                {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                {
+                    "role": "user",
+                    "content": "I want to return a pair of shoes I bought last week."
+                }
+            ],
+            "evaluation": {
+                "type": "response",
+                "criteria": [
+                    {
+                        "name": "topic_focus",
+                        "arguments": {
+                            "expected_topic": "returns",
+                            "expected_language": "english"
+                        }
+                    }
+                ]
+            }
+        },
+        "output": {
+            "response": "I can help you start a return. Could you share the order ID and the reason for the return so I can get it set up?",
+            "tool_calls": []
+        }
+    }
+]

@@ -215,6 +215,17 @@ Examples:
         default=None,
         help="Path to optional JSON config file with judge settings (model, prompt)",
     )
+    stt_parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip STT inference and run evaluators directly on a dataset of (gt, pred) pairs",
+    )
+    stt_parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to dataset JSON (list of {id, gt, pred}). Required with --eval-only.",
+    )
 
     # ── TTS ───────────────────────────────────────────────────────
     # `calibrate tts` with no args → interactive UI
@@ -303,6 +314,17 @@ Examples:
         action="store_true",
         help="Skip agent connection verification (used internally when already verified)",
     )
+    llm_parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip LLM inference and run evaluators on a dataset of (test_case, output) pairs",
+    )
+    llm_parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to dataset JSON for --eval-only (list of {test_case, output} items)",
+    )
     # ── Simulations ─────────────────────────────────────────────
     # `calibrate simulations` with no args → interactive UI
     # `calibrate simulations --type text -c config.json ...` → run directly
@@ -369,6 +391,17 @@ Examples:
         action="store_true",
         help="Skip agent connection verification (used internally when already verified)",
     )
+    sim_parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip simulation and run evaluators on a dataset of pre-existing transcripts (text simulation only)",
+    )
+    sim_parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to dataset JSON for --eval-only (list of {transcript, persona?, scenario?, name?})",
+    )
 
     # Hidden internal subcommand for simulation leaderboard
     sim_subparsers = sim_parser.add_subparsers(dest="sim_subcmd", metavar="")
@@ -408,8 +441,24 @@ Examples:
 
     # ── Dispatch ────────────────────────────────────────────────
     if args.component == "stt":
-        # If provider is given, run evaluation directly; otherwise launch interactive UI
-        if args.provider is not None:
+        # eval-only: skip STT inference and run evaluators on a (gt, pred) dataset.
+        # benchmark: --provider given → run inference + evaluators.
+        # neither: launch interactive UI.
+        if args.eval_only:
+            from calibrate.stt.benchmark import main as stt_benchmark_main
+
+            if not args.dataset:
+                print("\033[31mError: --dataset is required with --eval-only\033[0m")
+                sys.exit(1)
+
+            argv = ["calibrate", "--eval-only", "--dataset", args.dataset]
+            argv.extend(["-o", args.output_dir])
+            if args.config:
+                argv.extend(["--config", args.config])
+
+            sys.argv = argv
+            asyncio.run(stt_benchmark_main())
+        elif args.provider is not None:
             from calibrate.stt.benchmark import main as stt_benchmark_main
 
             providers = args.provider
@@ -459,7 +508,29 @@ Examples:
             _launch_ink_ui("tts")
 
     elif args.component == "llm":
-        if getattr(args, "verify", False):
+        if getattr(args, "eval_only", False):
+            if args.config is None:
+                print("Error: --config is required with --eval-only")
+                sys.exit(1)
+            if not getattr(args, "dataset", None):
+                print("Error: --dataset is required with --eval-only")
+                sys.exit(1)
+
+            from calibrate.llm.run_tests import main as llm_run_tests_main
+
+            argv = [
+                "calibrate",
+                "-c",
+                args.config,
+                "-o",
+                args.output_dir,
+                "--eval-only",
+                "--dataset",
+                args.dataset,
+            ]
+            sys.argv = argv
+            asyncio.run(llm_run_tests_main())
+        elif getattr(args, "verify", False):
             if not args.agent_url:
                 print("Error: --agent-url is required with --verify")
                 sys.exit(1)
@@ -592,6 +663,24 @@ Examples:
             _launch_ink_ui("simulations")
         elif args.type == "text":
             from calibrate.llm.run_simulation import main as llm_simulation_main
+
+            # Eval-only: skip agent verification entirely; the dataset already
+            # contains the transcripts and we only run evaluators on them.
+            if getattr(args, "eval_only", False):
+                if not getattr(args, "dataset", None):
+                    print("Error: --dataset is required with --eval-only")
+                    sys.exit(1)
+                sys.argv = ["calibrate"] + _args_to_argv(
+                    args,
+                    exclude_keys={
+                        "component",
+                        "sim_subcmd",
+                        "type",
+                        "skip_verify",
+                    },
+                )
+                asyncio.run(llm_simulation_main())
+                return
 
             # Pre-verify agent connection if config has agent_url
             if args.config:

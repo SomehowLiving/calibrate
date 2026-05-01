@@ -26,6 +26,7 @@ from typing import Literal
 
 from calibrate.stt.eval import (
     run_single_provider_eval,
+    run_eval_only,
     validate_stt_input_dir,
     STT_PROVIDERS,
     STT_LANGUAGES,
@@ -160,8 +161,18 @@ async def main():
         "--provider",
         type=str,
         nargs="+",
-        required=True,
-        help="STT provider(s) to evaluate (space-separated for multiple)",
+        help="STT provider(s) to evaluate (space-separated for multiple). Not required with --eval-only.",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip STT inference and run evaluators directly on a dataset of (gt, pred) pairs",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to dataset JSON (list of {id, gt, pred}). Required with --eval-only.",
     )
     parser.add_argument(
         "-l",
@@ -175,8 +186,7 @@ async def main():
         "-i",
         "--input-dir",
         type=str,
-        required=True,
-        help="Path to the input directory containing the audio files and stt.csv",
+        help="Path to the input directory containing the audio files and stt.csv. Not required with --eval-only.",
     )
     parser.add_argument(
         "-f",
@@ -233,18 +243,30 @@ async def main():
 
     providers = args.provider
 
-    # Validate all providers
-    for provider in providers:
-        if provider not in STT_PROVIDERS:
-            print(f"\033[31mError: Invalid provider '{provider}'.\033[0m")
-            print(f"Available providers: {', '.join(STT_PROVIDERS)}")
+    if args.eval_only:
+        if not args.dataset:
+            print("\033[31mError: --dataset is required with --eval-only\033[0m")
+            sys.exit(1)
+    else:
+        if not providers:
+            print("\033[31mError: --provider is required (omit only with --eval-only)\033[0m")
+            sys.exit(1)
+        if not args.input_dir:
+            print("\033[31mError: --input-dir is required (omit only with --eval-only)\033[0m")
             sys.exit(1)
 
-    # Validate input directory structure
-    is_valid, error_msg = validate_stt_input_dir(args.input_dir, args.input_file_name)
-    if not is_valid:
-        print(f"\033[31mInput validation error: {error_msg}\033[0m")
-        sys.exit(1)
+        # Validate all providers
+        for provider in providers:
+            if provider not in STT_PROVIDERS:
+                print(f"\033[31mError: Invalid provider '{provider}'.\033[0m")
+                print(f"Available providers: {', '.join(STT_PROVIDERS)}")
+                sys.exit(1)
+
+        # Validate input directory structure
+        is_valid, error_msg = validate_stt_input_dir(args.input_dir, args.input_file_name)
+        if not is_valid:
+            print(f"\033[31mInput validation error: {error_msg}\033[0m")
+            sys.exit(1)
 
     # ``exist_ok=True`` makes this safe when several ``calibrate stt``
     # subprocesses race to create the output dir on first use; the previous
@@ -264,15 +286,7 @@ async def main():
     sys.stderr = StreamTee(original_stderr, log_file)
 
     try:
-        print("\n\033[91mSTT Benchmark\033[0m\n")
-        print(f"Provider(s): {', '.join(providers)}")
-        print(f"Language: {args.language}")
-        print(f"Input: {args.input_dir}")
-        print(f"Output: {args.output_dir}")
-        print("")
-
-        # Run benchmark
-        # Load evaluators from optional config file
+        # Load evaluators from optional config file (shared by both flows)
         judge_evaluators = None
         if args.config:
             import json as _json
@@ -280,6 +294,44 @@ async def main():
             with open(args.config) as _f:
                 _cfg = _json.load(_f)
             judge_evaluators = _cfg.get("evaluators")
+
+        if args.eval_only:
+            print("\n\033[91mSTT Eval-Only\033[0m\n")
+            print(f"Dataset: {args.dataset}")
+            print(f"Output: {args.output_dir}")
+            print("")
+
+            result = await run_eval_only(
+                dataset_path=args.dataset,
+                output_dir=args.output_dir,
+                judge_evaluators=judge_evaluators,
+            )
+
+            print(f"\n\033[92m{'='*60}\033[0m")
+            print(f"\033[92mSummary\033[0m")
+            print(f"\033[92m{'='*60}\033[0m\n")
+
+            if result.get("status") == "error":
+                print(f"  \033[31mError - {result.get('error')}\033[0m")
+                sys.exit(1)
+
+            metrics = result.get("metrics", {})
+            wer = metrics.get("wer", 0)
+            judge_scores = {
+                k: v["mean"]
+                for k, v in metrics.items()
+                if isinstance(v, dict) and "type" in v
+            }
+            judge_str = ", ".join(f"{k}={v:.4f}" for k, v in judge_scores.items())
+            print(f"  WER={wer:.4f}, {judge_str}")
+            return
+
+        print("\n\033[91mSTT Benchmark\033[0m\n")
+        print(f"Provider(s): {', '.join(providers)}")
+        print(f"Language: {args.language}")
+        print(f"Input: {args.input_dir}")
+        print(f"Output: {args.output_dir}")
+        print("")
 
         result = await run(
             providers=providers,

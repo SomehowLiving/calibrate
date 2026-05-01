@@ -57,6 +57,32 @@ from calibrate.judges import (
 )
 
 
+async def _judge_and_emit(
+    transcript: list,
+    evaluators: list,
+    fallback_judge_model: str,
+    emit,
+) -> list[dict]:
+    """Run the simulation judge, build evaluation rows, and stream them via ``emit``.
+
+    ``emit`` is called with the prelude line and each formatted evaluator-row
+    line. Caller controls the sink (``log_and_print`` for live runs that have a
+    per-simulation logger context, ``print`` with a name prefix for eval-only).
+    """
+    emit(f"Evaluating the conversation against {len(evaluators)} evaluator(s).")
+    llm_judge_result = await evaluate_simuation(
+        transcript, evaluators, fallback_model=fallback_judge_model
+    )
+    evaluation_results = [
+        _build_evaluation_result(ev, llm_judge_result[ev["name"]])
+        for ev in evaluators
+    ]
+    for row in evaluation_results:
+        for line in format_evaluation_result_lines(row):
+            emit(line)
+    return evaluation_results
+
+
 def _build_evaluation_result(evaluator: dict, judge_row: dict) -> dict:
     """Build a per-row evaluation result, carrying rating scale bounds when relevant.
 
@@ -525,21 +551,9 @@ async def run_simulation(
             }
         )
 
-    log_and_print(
-        f"Evaluating the conversation against {len(evaluators)} evaluator(s)."
+    evaluation_results = await _judge_and_emit(
+        transcript, evaluators, fallback_judge_model, emit=log_and_print
     )
-    llm_judge_result = await evaluate_simuation(
-        transcript, evaluators, fallback_model=fallback_judge_model
-    )
-
-    evaluation_results = [
-        _build_evaluation_result(ev, llm_judge_result[ev["name"]])
-        for ev in evaluators
-    ]
-
-    for row in evaluation_results:
-        for line in format_evaluation_result_lines(row):
-            log_and_print(line)
 
     return {
         "transcript": transcript,
@@ -675,21 +689,9 @@ async def run_simulation_with_agent(
 
     _save_transcript(output_dir, transcript)
 
-    log_and_print(
-        f"Evaluating the conversation against {len(evaluators)} evaluator(s)."
+    evaluation_results = await _judge_and_emit(
+        transcript, evaluators, fallback_judge_model, emit=log_and_print
     )
-    llm_judge_result = await evaluate_simuation(
-        transcript, evaluators, fallback_model=fallback_judge_model
-    )
-
-    evaluation_results = [
-        _build_evaluation_result(ev, llm_judge_result[ev["name"]])
-        for ev in evaluators
-    ]
-
-    for row in evaluation_results:
-        for line in format_evaluation_result_lines(row):
-            log_and_print(line)
 
     return {
         "transcript": transcript,
@@ -887,6 +889,17 @@ async def main():
         default=1,
         help="Number of simulations to run in parallel",
     )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip simulation and run evaluators on a dataset of pre-existing transcripts",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Path to dataset JSON for --eval-only (list of {transcript, persona?, scenario?, name?})",
+    )
 
     args = parser.parse_args()
 
@@ -900,6 +913,28 @@ async def main():
         sys.exit(1)
 
     output_dir = args.output_dir
+
+    if args.eval_only:
+        if not args.dataset:
+            print("Error: --dataset is required with --eval-only", file=sys.stderr)
+            sys.exit(1)
+        with open(args.dataset) as _f:
+            dataset = json.load(_f)
+        print("\n\033[91mText Simulation Eval-Only\033[0m\n")
+        print(f"Config: {args.config}")
+        print(f"Dataset: {args.dataset}")
+        print(f"Output: {output_dir}\n")
+
+        failed_count = await run_eval_only_simulations(
+            config=config,
+            dataset=dataset,
+            output_dir=output_dir,
+            parallel=args.parallel,
+        )
+        if failed_count:
+            print(f"\n\033[31m{failed_count} simulation(s) failed\033[0m")
+            sys.exit(1)
+        return
 
     os.makedirs(output_dir, exist_ok=True)
     write_evaluator_config(output_dir, config["evaluators"])
@@ -937,10 +972,30 @@ async def main():
     # Run all tasks with controlled parallelism
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Collect metrics from results
+    failed = _aggregate_and_write_simulation_results(results, output_dir)
+
+    if failed:
+        print(f"\n\033[31m{len(failed)} simulation(s) failed:\033[0m")
+        for err in failed:
+            print(f"  \033[31m- {err}\033[0m")
+        sys.exit(1)
+
+
+def _aggregate_and_write_simulation_results(
+    results: list, output_dir: str
+) -> list:
+    """Aggregate per-simulation results into ``results.csv`` and ``metrics.json``.
+
+    Each non-Exception result is a ``(simulation_metrics, evaluation_results)``
+    tuple. Returns the list of Exception entries (failed simulations) so the
+    caller can surface them.
+    """
     metrics = defaultdict(list)
     all_simulation_metrics = []
     failed_simulations = []
+    criterion_types: dict = {}
+    criterion_ids: dict = {}
+    criterion_scales: dict = {}
 
     for result in results:
         if isinstance(result, Exception):
@@ -953,16 +1008,6 @@ async def main():
 
         for metric_dict in evaluation_results:
             metrics[metric_dict["name"]].append(float(metric_dict["value"]))
-
-    # Track criterion types and scale bounds per metric name
-    criterion_types: dict = {}
-    criterion_ids: dict = {}
-    criterion_scales: dict = {}
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-        _, evaluation_results = result
-        for metric_dict in evaluation_results:
             criterion_types.setdefault(
                 metric_dict["name"], metric_dict.get("type", "binary")
             )
@@ -977,7 +1022,6 @@ async def main():
                 )
 
     metrics_summary = {}
-
     for metric_name, metric_values in metrics.items():
         entry = {
             "type": criterion_types.get(metric_name, "binary"),
@@ -997,11 +1041,85 @@ async def main():
     with open(join(output_dir, "metrics.json"), "w") as f:
         json.dump(metrics_summary, f, indent=4)
 
-    if failed_simulations:
-        print(f"\n\033[31m{len(failed_simulations)} simulation(s) failed:\033[0m")
-        for err in failed_simulations:
-            print(f"  \033[31m- {err}\033[0m")
-        sys.exit(1)
+    return failed_simulations
+
+
+async def run_eval_only_simulation_task(
+    semaphore: asyncio.Semaphore,
+    item: dict,
+    item_index: int,
+    evaluators: list[dict],
+    output_dir: str,
+    fallback_judge_model: str = DEFAULT_SIMULATION_JUDGE_MODEL,
+):
+    """Evaluate a single pre-existing transcript and write per-simulation files.
+
+    ``item`` schema: ``{"conversation_history": [...], "name": str?}``. Only
+    ``conversation_history`` is required — it's the sole input to the
+    evaluators. ``name`` controls the per-simulation output subdirectory
+    (defaults to ``simulation_<index>``).
+    """
+    async with semaphore:
+        transcript = item["conversation_history"]
+        simulation_name = item.get("name") or f"simulation_{item_index + 1}"
+
+        simulation_output_dir = join(output_dir, simulation_name)
+        if exists(simulation_output_dir):
+            shutil.rmtree(simulation_output_dir)
+        os.makedirs(simulation_output_dir)
+
+        evaluation_results = await _judge_and_emit(
+            transcript,
+            evaluators,
+            fallback_judge_model,
+            emit=lambda line: print(f"[{simulation_name}] {line}"),
+        )
+
+        with open(join(simulation_output_dir, "transcript.json"), "w") as f:
+            json.dump(transcript, f, indent=4)
+
+        pd.DataFrame(evaluation_results).to_csv(
+            join(simulation_output_dir, "evaluation_results.csv"), index=False
+        )
+
+        simulation_metrics = {"name": simulation_name}
+        for metric_dict in evaluation_results:
+            simulation_metrics[metric_dict["name"]] = float(metric_dict["value"])
+
+        return simulation_metrics, evaluation_results
+
+
+async def run_eval_only_simulations(
+    config: dict,
+    dataset: list[dict],
+    output_dir: str,
+    parallel: int = 1,
+) -> int:
+    """Run evaluators on a pre-existing dataset of simulation transcripts.
+
+    Returns the number of failed simulations.
+    """
+    evaluators = config.get("evaluators") or []
+    require_simulation_evaluators(evaluators)
+
+    os.makedirs(output_dir, exist_ok=True)
+    write_evaluator_config(output_dir, evaluators)
+
+    semaphore = asyncio.Semaphore(parallel)
+    tasks = [
+        run_eval_only_simulation_task(
+            semaphore=semaphore,
+            item=item,
+            item_index=i,
+            evaluators=evaluators,
+            output_dir=output_dir,
+        )
+        for i, item in enumerate(dataset)
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    failed = _aggregate_and_write_simulation_results(results, output_dir)
+    return len(failed)
 
 
 if __name__ == "__main__":

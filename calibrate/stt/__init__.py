@@ -31,10 +31,19 @@ from calibrate.stt.benchmark import run
 # Single provider evaluation (no leaderboard)
 from calibrate.stt.eval import run_single_provider_eval as run_single
 
+# Run evaluators only on a pre-existing (gt, pred) dataset
+from calibrate.stt.eval import run_eval_only
+
 # Leaderboard generation
 from calibrate.stt.leaderboard import generate_leaderboard
 
 # Input validation
 from calibrate.stt.eval import validate_stt_input_dir
 
-__all__ = ["run", "run_single", "generate_leaderboard", "validate_stt_input_dir"]
+__all__ = [
+    "run",
+    "run_single",
+    "run_eval_only",
+    "generate_leaderboard",
+    "validate_stt_input_dir",
+]

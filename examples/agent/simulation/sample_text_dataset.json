@@ -1,0 +1,24 @@
+[
+    {
+        "name": "simulation_1",
+        "conversation_history": [
+            {"role": "assistant", "content": "Hello! How can I help you today?"},
+            {"role": "user", "content": "Hi! I'd like to check my order. The order ID is ORD-12345."},
+            {"role": "assistant", "content": "Let me look that up for you.", "tool_calls": [{"tool": "check_order", "arguments": {"query": {"order_id": "ORD-12345"}}}]},
+            {"role": "tool", "content": "{\"status\": \"shipped\", \"eta\": \"2 days\"}"},
+            {"role": "assistant", "content": "Your order ORD-12345 has shipped and should arrive in about 2 days. Anything else I can help with?"},
+            {"role": "user", "content": "That's great, thank you!"}
+        ]
+    },
+    {
+        "name": "simulation_2",
+        "conversation_history": [
+            {"role": "assistant", "content": "Hello! How can I help you today?"},
+            {"role": "user", "content": "Order ORD-99999 — where is it?"},
+            {"role": "assistant", "content": "One moment.", "tool_calls": [{"tool": "check_order", "arguments": {"query": {"order_id": "ORD-99999"}}}]},
+            {"role": "tool", "content": "{\"status\": \"processing\"}"},
+            {"role": "assistant", "content": "Your order is still being processed and hasn't shipped yet."},
+            {"role": "user", "content": "Ugh, fine."}
+        ]
+    }
+]

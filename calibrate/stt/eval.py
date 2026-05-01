@@ -852,68 +852,181 @@ async def run_single_provider_eval(
         _log(f"gt_transcripts: {all_gt_transcripts}", to_terminal=False)
         _log(f"pred_transcripts: {all_pred_transcripts}", to_terminal=False)
 
-        wer_results = get_wer_score(all_gt_transcripts, all_pred_transcripts)
-        _log(f"WER: {wer_results['score']}", to_terminal=False)
-
-        _evaluators = judge_evaluators if judge_evaluators else [DEFAULT_STT_EVALUATOR]
-        require_unique_evaluator_names(_evaluators)
-        write_evaluator_config(output_dir, _evaluators)
-        llm_results = await get_llm_judge_score(
-            all_gt_transcripts,
-            all_pred_transcripts,
-            evaluators=_evaluators,
+        # Evaluator config is written at the parent ``output_dir`` (shared
+        # across providers in a benchmark run), while per-provider results
+        # live in ``provider_output_dir``.
+        metrics_data = await _score_and_write_results(
+            ids=all_ids,
+            gt_transcripts=all_gt_transcripts,
+            pred_transcripts=all_pred_transcripts,
+            output_dir=provider_output_dir,
+            evaluator_config_dir=output_dir,
+            judge_evaluators=judge_evaluators,
         )
-        for name, score_dict in llm_results["scores"].items():
-            _log(f"  {name}: {score_dict['mean']:.4f}")
-
-        # Map evaluator name → evaluator dict (for per-row value extraction)
-        _evaluators_by_name = {ev["name"]: ev for ev in _evaluators}
-
-        metrics_data = {
-            "wer": wer_results["score"],
-        }
-        # Each evaluator gets one entry keyed by its name. The value is the
-        # full per-criterion dict (``type``, ``mean``, plus ``scale_min``/
-        # ``scale_max`` for ratings). Downstream consumers (leaderboard,
-        # summary print, UI) detect evaluators as dict values that carry a
-        # ``type`` field.
-        for name, score_dict in llm_results["scores"].items():
-            metrics_data[name] = score_dict
-
-        data = []
-        for _id, gt_text, pred_text, wer, llm_row in zip(
-            all_ids,
-            all_gt_transcripts,
-            all_pred_transcripts,
-            wer_results["per_row"],
-            llm_results["per_row"],
-        ):
-            row = {
-                "id": _id,
-                "gt": gt_text,
-                "pred": pred_text,
-                "wer": wer,
-            }
-            for name, ev in _evaluators_by_name.items():
-                ev_result = llm_row[name]
-                if is_rating(ev):
-                    row[name] = ev_result["score"]
-                else:
-                    row[name] = bool(ev_result["match"])
-                row[f"{name}_reasoning"] = ev_result["reasoning"]
-            data.append(row)
-
-        metrics_save_path = join(provider_output_dir, "metrics.json")
-        with open(metrics_save_path, "w") as f:
-            json.dump(metrics_data, f, indent=4)
-
-        pd.DataFrame(data).to_csv(join(provider_output_dir, "results.csv"), index=False)
 
         return {
             "provider": provider,
             "status": "completed",
             "metrics": metrics_data,
             "output_dir": provider_output_dir,
+        }
+    finally:
+        _current_log_file.reset(token)
+
+
+def validate_stt_eval_only_dataset(dataset_path: str) -> tuple[bool, str, list[dict]]:
+    """Validate an eval-only dataset JSON file.
+
+    Expected format: a JSON list of objects with ``id``, ``gt`` and ``pred`` fields.
+
+    Returns:
+        tuple[bool, str, list[dict]]: (is_valid, error_message, parsed_rows)
+    """
+    if not exists(dataset_path):
+        return False, f"Dataset file does not exist: {dataset_path}", []
+
+    try:
+        with open(dataset_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"Failed to parse dataset JSON: {e}", []
+
+    if not isinstance(data, list):
+        return False, "Dataset must be a JSON list of objects", []
+
+    required = {"id", "gt", "pred"}
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            return False, f"Row {i} is not an object", []
+        missing = required - row.keys()
+        if missing:
+            return (
+                False,
+                f"Row {i} missing required fields: {sorted(missing)}. Each row needs 'id', 'gt', 'pred'.",
+                [],
+            )
+
+    return True, "", data
+
+
+async def _score_and_write_results(
+    ids: list,
+    gt_transcripts: list[str],
+    pred_transcripts: list[str],
+    output_dir: str,
+    evaluator_config_dir: str,
+    judge_evaluators: list[dict] = None,
+) -> dict:
+    """Run WER + LLM-judge evaluators over (gt, pred) pairs and write outputs.
+
+    Writes ``results.csv`` and ``metrics.json`` under ``output_dir`` and the
+    resolved evaluator config under ``evaluator_config_dir``. Returns the
+    metrics_data dict.
+    """
+    wer_results = get_wer_score(gt_transcripts, pred_transcripts)
+    _log(f"WER: {wer_results['score']}", to_terminal=False)
+
+    _evaluators = judge_evaluators if judge_evaluators else [DEFAULT_STT_EVALUATOR]
+    require_unique_evaluator_names(_evaluators)
+    write_evaluator_config(evaluator_config_dir, _evaluators)
+    llm_results = await get_llm_judge_score(
+        gt_transcripts,
+        pred_transcripts,
+        evaluators=_evaluators,
+    )
+    for name, score_dict in llm_results["scores"].items():
+        _log(f"  {name}: {score_dict['mean']:.4f}")
+
+    _evaluators_by_name = {ev["name"]: ev for ev in _evaluators}
+
+    metrics_data = {"wer": wer_results["score"]}
+    for name, score_dict in llm_results["scores"].items():
+        metrics_data[name] = score_dict
+
+    data = []
+    for _id, gt_text, pred_text, wer, llm_row in zip(
+        ids,
+        gt_transcripts,
+        pred_transcripts,
+        wer_results["per_row"],
+        llm_results["per_row"],
+    ):
+        row = {
+            "id": _id,
+            "gt": gt_text,
+            "pred": pred_text,
+            "wer": wer,
+        }
+        for name, ev in _evaluators_by_name.items():
+            ev_result = llm_row[name]
+            if is_rating(ev):
+                row[name] = ev_result["score"]
+            else:
+                row[name] = bool(ev_result["match"])
+            row[f"{name}_reasoning"] = ev_result["reasoning"]
+        data.append(row)
+
+    with open(join(output_dir, "metrics.json"), "w") as f:
+        json.dump(metrics_data, f, indent=4)
+
+    pd.DataFrame(data).to_csv(join(output_dir, "results.csv"), index=False)
+
+    return metrics_data
+
+
+async def run_eval_only(
+    dataset_path: str,
+    output_dir: str,
+    judge_evaluators: list[dict] = None,
+) -> dict:
+    """Run evaluators only on a pre-existing dataset of (gt, pred) pairs.
+
+    Skips STT inference. Writes ``metrics.json`` and ``results.csv`` directly
+    under ``output_dir``.
+
+    Args:
+        dataset_path: Path to a JSON file with a list of {"id", "gt", "pred"} rows.
+        output_dir: Directory to write results and metrics.
+        judge_evaluators: Optional list of evaluator dicts. Defaults to the
+            built-in STT evaluator when omitted.
+
+    Returns:
+        dict with status, metrics, and output_dir.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    log_save_path = join(output_dir, "logs")
+    if exists(log_save_path):
+        os.remove(log_save_path)
+
+    token = _current_log_file.set(log_save_path)
+    try:
+        _log("--------------------------------")
+        _log("\033[33mRunning STT eval-only on dataset\033[0m")
+        _log(f"Dataset: {dataset_path}")
+
+        is_valid, error_msg, rows = validate_stt_eval_only_dataset(dataset_path)
+        if not is_valid:
+            _log(f"\033[31mError: {error_msg}\033[0m")
+            return {"status": "error", "error": error_msg}
+
+        ids = [r["id"] for r in rows]
+        gts = [str(r["gt"]) for r in rows]
+        preds = [str(r["pred"]) if r["pred"] is not None else "" for r in rows]
+
+        metrics_data = await _score_and_write_results(
+            ids=ids,
+            gt_transcripts=gts,
+            pred_transcripts=preds,
+            output_dir=output_dir,
+            evaluator_config_dir=output_dir,
+            judge_evaluators=judge_evaluators,
+        )
+
+        return {
+            "status": "completed",
+            "metrics": metrics_data,
+            "output_dir": output_dir,
         }
     finally:
         _current_log_file.reset(token)
