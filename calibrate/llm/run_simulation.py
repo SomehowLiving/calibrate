@@ -1091,14 +1091,19 @@ async def run_eval_only_simulation_task(
 
     ``item`` schema: ``{"conversation_history": [...], "name": str?}``. Only
     ``conversation_history`` is required — it's the sole input to the
-    evaluators. ``name`` controls the per-simulation output subdirectory
-    (defaults to ``simulation_<index>``).
+    evaluators. ``name`` is optional metadata preserved into the aggregated
+    outputs and ``dataset_map.json`` for traceability.
+
+    The per-simulation output subdirectory is derived from a stable internal
+    ``row_id`` (``row_<1-based-index>``), not from the user-provided ``name``,
+    so duplicate or empty names cannot collide on disk.
     """
     async with semaphore:
         transcript = item["conversation_history"]
-        simulation_name = item.get("name") or f"simulation_{item_index + 1}"
+        row_id = f"row_{item_index + 1}"
+        display_name = item.get("name") or row_id
 
-        simulation_output_dir = join(output_dir, simulation_name)
+        simulation_output_dir = join(output_dir, row_id)
         if exists(simulation_output_dir):
             shutil.rmtree(simulation_output_dir)
         os.makedirs(simulation_output_dir)
@@ -1107,7 +1112,7 @@ async def run_eval_only_simulation_task(
             transcript,
             evaluators,
             fallback_judge_model,
-            emit=lambda line: print(f"[{simulation_name}] {line}"),
+            emit=lambda line: print(f"[{display_name}] {line}"),
         )
 
         with open(join(simulation_output_dir, "transcript.json"), "w") as f:
@@ -1117,7 +1122,7 @@ async def run_eval_only_simulation_task(
             join(simulation_output_dir, "evaluation_results.csv"), index=False
         )
 
-        simulation_metrics = {"name": simulation_name}
+        simulation_metrics = {"row_id": row_id, "name": display_name}
         for metric_dict in evaluation_results:
             simulation_metrics[metric_dict["name"]] = float(metric_dict["value"])
 
@@ -1139,6 +1144,18 @@ async def run_eval_only_simulations(
 
     os.makedirs(output_dir, exist_ok=True)
     write_evaluator_config(output_dir, evaluators)
+
+    # Map internal row_id ↔ original dataset row, so the caller can correlate
+    # per-simulation subdirectories back to whatever name/index they passed in.
+    dataset_map = {
+        f"row_{i + 1}": {
+            "index": i,
+            "name": item.get("name"),
+        }
+        for i, item in enumerate(dataset)
+    }
+    with open(join(output_dir, "dataset_map.json"), "w") as f:
+        json.dump(dataset_map, f, indent=4)
 
     semaphore = asyncio.Semaphore(parallel)
     tasks = [
