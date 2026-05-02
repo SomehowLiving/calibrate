@@ -400,7 +400,7 @@ Examples:
         "--dataset",
         type=str,
         default=None,
-        help="Path to dataset JSON for --eval-only (list of {transcript, persona?, scenario?, name?})",
+        help="Path to dataset JSON for --eval-only (list of {conversation_history, name?})",
     )
 
     # Hidden internal subcommand for simulation leaderboard

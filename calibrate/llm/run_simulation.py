@@ -898,7 +898,7 @@ async def main():
         "--dataset",
         type=str,
         default=None,
-        help="Path to dataset JSON for --eval-only (list of {transcript, persona?, scenario?, name?})",
+        help="Path to dataset JSON for --eval-only (list of {conversation_history, name?})",
     )
 
     args = parser.parse_args()
@@ -918,8 +918,21 @@ async def main():
         if not args.dataset:
             print("Error: --dataset is required with --eval-only", file=sys.stderr)
             sys.exit(1)
-        with open(args.dataset) as _f:
-            dataset = json.load(_f)
+        try:
+            with open(args.dataset) as _f:
+                dataset = json.load(_f)
+        except Exception as e:
+            print(
+                f"Error: failed to read dataset {args.dataset}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        is_valid, err = validate_simulation_eval_only_dataset(dataset)
+        if not is_valid:
+            print(f"Dataset validation error: {err}", file=sys.stderr)
+            sys.exit(1)
+
         print("\n\033[91mText Simulation Eval-Only\033[0m\n")
         print(f"Config: {args.config}")
         print(f"Dataset: {args.dataset}")
@@ -1042,6 +1055,28 @@ def _aggregate_and_write_simulation_results(
         json.dump(metrics_summary, f, indent=4)
 
     return failed_simulations
+
+
+def validate_simulation_eval_only_dataset(dataset: object) -> tuple[bool, str]:
+    """Validate the shape of a text-simulation eval-only dataset.
+
+    Each item must be ``{"conversation_history": list, "name"?: str}``.
+    Returns ``(is_valid, error_message)``.
+    """
+    if not isinstance(dataset, list):
+        return False, "Dataset must be a JSON list of {conversation_history, name?} items"
+
+    for i, item in enumerate(dataset):
+        if not isinstance(item, dict):
+            return False, f"Item {i}: must be an object"
+        if "conversation_history" not in item:
+            return False, f"Item {i}: missing required field 'conversation_history'"
+        if not isinstance(item["conversation_history"], list):
+            return False, f"Item {i}: 'conversation_history' must be a list"
+        if "name" in item and not isinstance(item["name"], str):
+            return False, f"Item {i}: 'name' must be a string when provided"
+
+    return True, ""
 
 
 async def run_eval_only_simulation_task(

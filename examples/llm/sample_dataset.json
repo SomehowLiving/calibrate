@@ -119,7 +119,11 @@
                 "type": "response",
                 "criteria": [
                     {
-                        "name": "relevance"
+                        "name": "relevance",
+                        "arguments": {
+                            "expected_topic": "product availability",
+                            "product": "laptop"
+                        }
                     },
                     {
                         "name": "tone"
@@ -129,37 +133,6 @@
         },
         "output": {
             "response": "We do carry laptops! Could you share a bit about what you're looking for — preferred screen size, intended use, or budget — so I can point you to the right options?",
-            "tool_calls": []
-        }
-    },
-    {
-        "test_case": {
-            "id": "test-response-3-with-vars",
-            "history": [
-                {
-                    "role": "assistant",
-                    "content": "Hello! How can I help you today?"
-                },
-                {
-                    "role": "user",
-                    "content": "I want to return a pair of shoes I bought last week."
-                }
-            ],
-            "evaluation": {
-                "type": "response",
-                "criteria": [
-                    {
-                        "name": "topic_focus",
-                        "arguments": {
-                            "expected_topic": "returns",
-                            "expected_language": "english"
-                        }
-                    }
-                ]
-            }
-        },
-        "output": {
-            "response": "I can help you start a return. Could you share the order ID and the reason for the return so I can get it set up?",
             "tool_calls": []
         }
     }

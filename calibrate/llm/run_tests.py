@@ -1093,6 +1093,58 @@ def _write_test_results_outputs(
     return passed, total
 
 
+def validate_llm_eval_only_dataset(
+    dataset: object,
+) -> tuple[bool, str]:
+    """Validate the shape of an LLM eval-only dataset.
+
+    Each item must be ``{"test_case": {history, evaluation}, "output":
+    {response, tool_calls}}``. Returns ``(is_valid, error_message)``; the
+    caller is expected to surface the message and exit non-zero on failure.
+    """
+    if not isinstance(dataset, list):
+        return False, "Dataset must be a JSON list of {test_case, output} items"
+
+    for i, item in enumerate(dataset):
+        if not isinstance(item, dict):
+            return False, f"Item {i}: must be an object"
+        if "test_case" not in item or "output" not in item:
+            return (
+                False,
+                f"Item {i}: missing required keys 'test_case' and/or 'output'",
+            )
+        tc = item["test_case"]
+        out = item["output"]
+        if not isinstance(tc, dict):
+            return False, f"Item {i}: 'test_case' must be an object"
+        if not isinstance(out, dict):
+            return False, f"Item {i}: 'output' must be an object"
+        if "history" not in tc or "evaluation" not in tc:
+            return (
+                False,
+                f"Item {i}: 'test_case' missing required fields 'history' and/or 'evaluation'",
+            )
+        if not isinstance(tc["history"], list):
+            return False, f"Item {i}: 'test_case.history' must be a list"
+        if not isinstance(tc["evaluation"], dict):
+            return False, f"Item {i}: 'test_case.evaluation' must be an object"
+        ev_type = tc["evaluation"].get("type")
+        if ev_type not in ("response", "tool_call"):
+            return (
+                False,
+                f"Item {i}: 'test_case.evaluation.type' must be 'response' or 'tool_call' (got {ev_type!r})",
+            )
+        if "response" not in out or "tool_calls" not in out:
+            return (
+                False,
+                f"Item {i}: 'output' must include 'response' (str) and 'tool_calls' (list)",
+            )
+        if not isinstance(out.get("tool_calls", []), list):
+            return False, f"Item {i}: 'output.tool_calls' must be a list"
+
+    return True, ""
+
+
 async def run_eval_only_tests(
     config: dict,
     dataset: list[dict],
@@ -1226,8 +1278,17 @@ async def main():
             print("\033[31mError: --dataset is required with --eval-only\033[0m")
             sys.exit(1)
 
-        with open(args.dataset) as f:
-            dataset = json.load(f)
+        try:
+            with open(args.dataset) as f:
+                dataset = json.load(f)
+        except Exception as e:
+            print(f"\033[31mError: failed to read dataset {args.dataset}: {e}\033[0m")
+            sys.exit(1)
+
+        is_valid, err = validate_llm_eval_only_dataset(dataset)
+        if not is_valid:
+            print(f"\033[31mDataset validation error: {err}\033[0m")
+            sys.exit(1)
 
         print("\n\033[91mLLM Eval-Only\033[0m\n")
         print(f"Config: {args.config}")
