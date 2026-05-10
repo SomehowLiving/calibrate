@@ -15,7 +15,7 @@ from elevenlabs import VoiceSettings
 from elevenlabs.client import AsyncElevenLabs
 from groq import AsyncGroq
 from cartesia import AsyncCartesia
-from sarvamai import AsyncSarvamAI, AudioOutput
+from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse
 from google.cloud import texttospeech
 from smallestai.waves import TTSConfig, WavesStreamingTTS
 
@@ -339,10 +339,14 @@ async def synthesize_sarvam(text: str, language: str, audio_path: str) -> Dict:
     ttfb = None
 
     async with client.text_to_speech_streaming.connect(
-        model="bulbul:v3", send_completion_event=False
+        model="bulbul:v3", send_completion_event=True
     ) as ws:
         await ws.configure(
-            target_language_code=lang_code, speaker="aditya", output_audio_codec="wav"
+            target_language_code=lang_code,
+            speaker="aditya",
+            output_audio_codec="mp3",
+            speech_sample_rate=22050,
+            enable_preprocessing=True,
         )
 
         await ws.convert(text)
@@ -366,6 +370,10 @@ async def synthesize_sarvam(text: str, language: str, audio_path: str) -> Dict:
                     audio_chunk = base64.b64decode(message.data.audio)
                     f.write(audio_chunk)
                     f.flush()
+                elif isinstance(message, EventResponse):
+                    # Break when we receive the final event
+                    if message.data.event_type == "final":
+                        break
 
         # print(f"All {chunk_count} chunks saved to output.mp3")
         _log("\033[93mAudio generation complete\033[0m")
