@@ -33,6 +33,17 @@ calibrate simulations  # Interactive text or voice simulations
 
 - [CLI Documentation](https://calibrate.artpark.ai/docs/cli/overview)
 
+## Contributing
+
+After cloning the repo, enable the project's git hooks so the pre-commit test
+runner fires on commits to `main`:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Every contributor needs to run it once.
+
 ## License
 
 This work is licensed under a
