@@ -1,5 +1,5 @@
 """
-Tests for STT and TTS leaderboard generation.
+Tests for calibrate/stt/leaderboard.py.
 
 Covers:
 - Dynamic metric discovery from metrics.json (no hardcoded metric list)
@@ -8,7 +8,7 @@ Covers:
 - Skips the `leaderboard` subdir inside output_dir
 
 Run with:
-    python -m pytest tests/test_stt_tts_leaderboard.py -v
+    python -m unittest tests.stt.test_leaderboard -v
 """
 
 import json
@@ -20,7 +20,6 @@ import pandas as pd
 import openpyxl  # noqa: F401 — ensures xlsx reading works
 
 from calibrate.stt.leaderboard import generate_leaderboard as generate_stt_leaderboard
-from calibrate.tts.leaderboard import generate_leaderboard as generate_tts_leaderboard
 
 
 def _write_provider(
@@ -36,11 +35,6 @@ def _write_provider(
         pd.DataFrame(results_rows).to_csv(
             provider_dir / "results.csv", index=False
         )
-
-
-# ---------------------------------------------------------------------------
-# STT leaderboard
-# ---------------------------------------------------------------------------
 
 
 class TestSTTLeaderboard(unittest.TestCase):
@@ -114,57 +108,6 @@ class TestSTTLeaderboard(unittest.TestCase):
             xlsx = base / "leaderboard" / "stt_leaderboard.xlsx"
             summary = pd.read_excel(xlsx, sheet_name="summary")
             self.assertEqual(list(summary["run"]), ["provider-x"])
-
-
-# ---------------------------------------------------------------------------
-# TTS leaderboard
-# ---------------------------------------------------------------------------
-
-
-class TestTTSLeaderboard(unittest.TestCase):
-
-    def test_default_single_evaluator_and_ttfb(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            _write_provider(base, "openai", {
-                "pronunciation": {"type": "binary", "mean": 0.95},
-                "ttfb": {"mean": 0.4, "std": 0.05, "values": [0.35, 0.45]},
-            }, results_rows=[
-                {"id": 1, "text": "hi", "pronunciation": True, "ttfb": 0.4},
-            ])
-            _write_provider(base, "elevenlabs", {
-                "pronunciation": {"type": "binary", "mean": 0.8},
-                "ttfb": {"mean": 0.3, "std": 0.02, "values": [0.29, 0.31]},
-            }, results_rows=[
-                {"id": 1, "text": "hi", "pronunciation": True, "ttfb": 0.3},
-            ])
-
-            save_dir = base / "leaderboard"
-            generate_tts_leaderboard(str(base), str(save_dir))
-
-            xlsx = save_dir / "tts_leaderboard.xlsx"
-            self.assertTrue(xlsx.exists())
-            summary = pd.read_excel(xlsx, sheet_name="summary")
-            self.assertIn("pronunciation", summary.columns)
-            self.assertIn("ttfb", summary.columns)
-
-    def test_multi_criterion_metrics_surface_dynamically(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            _write_provider(base, "provider-a", {
-                "intelligibility": {"type": "binary", "mean": 0.9},
-                "pronunciation": {"type": "binary", "mean": 0.85},
-                "ttfb": {"mean": 0.4},
-            })
-
-            save_dir = base / "leaderboard"
-            generate_tts_leaderboard(str(base), str(save_dir))
-
-            xlsx = save_dir / "tts_leaderboard.xlsx"
-            summary = pd.read_excel(xlsx, sheet_name="summary")
-            self.assertIn("intelligibility", summary.columns)
-            self.assertIn("pronunciation", summary.columns)
-            self.assertIn("ttfb", summary.columns)
 
 
 if __name__ == "__main__":
