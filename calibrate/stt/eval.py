@@ -10,6 +10,7 @@ from os.path import join, exists
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urlencode
 import backoff
 from sarvamai import AsyncSarvamAI
 from openai import AsyncOpenAI
@@ -53,16 +54,17 @@ from calibrate.langfuse import (
 # =============================================================================
 
 
-def load_audio(audio_path: Path, as_file: bool = False):
+def load_audio(audio_path: Path, as_file: bool = False, raw_pcm: bool = False):
     """
-    Load audio file and convert to mono 16 kHz WAV format.
+    Load audio file and convert to mono 16 kHz, 16-bit audio.
 
     Args:
         audio_path: Path to audio file.
         as_file: If True, return a file-like BytesIO object. If False, return bytes.
+        raw_pcm: If True, return raw PCM bytes instead of WAV bytes.
 
     Returns:
-        Bytes or BytesIO of audio in mono, 16 kHz, 16-bit PCM WAV format.
+        Bytes or BytesIO of audio in mono, 16 kHz, 16-bit PCM format.
     """
     import io
 
@@ -79,6 +81,9 @@ def load_audio(audio_path: Path, as_file: bool = False):
     audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
     audio = audio.normalize()
     audio = audio.strip_silence(silence_len=100, silence_thresh=-40)
+
+    if raw_pcm:
+        return audio.raw_data
 
     # Export to WAV bytes
     out_io = io.BytesIO()
@@ -449,7 +454,7 @@ async def transcribe_smallest(audio_path: Path, language: str) -> str:
 
     lang_code = get_stt_language_code(language, "smallest")
 
-    endpoint = "https://waves-api.smallest.ai/api/v1/pulse/get_text"
+    endpoint = "https://api.smallest.ai/waves/v1/pulse/get_text"
     params = {
         "model": "pulse",
         "language": lang_code,
@@ -472,6 +477,90 @@ async def transcribe_smallest(audio_path: Path, language: str) -> str:
 
     return {
         "transcript": transcript,
+    }
+
+
+async def transcribe_smallest_streaming(audio_path: Path, language: str) -> str:
+    """Transcribe audio using Smallest's Pulse STT WebSocket API."""
+    try:
+        from websockets.asyncio.client import connect as websocket_connect
+    except ModuleNotFoundError as e:
+        raise ImportError(
+            "websockets is required for Smallest streaming STT. "
+            "Install with 'pip install websockets'."
+        ) from e
+
+    api_key = os.getenv("SMALLEST_API_KEY")
+    if not api_key:
+        raise ValueError("SMALLEST_API_KEY environment variable not set")
+
+    lang_code = get_stt_language_code(language, "smallest")
+    endpoint = "wss://api.smallest.ai/waves/v1/pulse/get_text"
+    params = {
+        "language": lang_code,
+        "encoding": "linear16",
+        "sample_rate": "16000",
+        "word_timestamps": "false",
+    }
+    ws_url = f"{endpoint}?{urlencode(params)}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    audio = load_audio(audio_path, raw_pcm=True)
+    chunk_size = 4096
+
+    async with websocket_connect(ws_url, additional_headers=headers) as ws:
+
+        async def send_audio():
+            for start in range(0, len(audio), chunk_size):
+                chunk = audio[start : start + chunk_size]
+                if chunk:
+                    await ws.send(chunk)
+                    await asyncio.sleep(0.05)
+
+            await ws.send(json.dumps({"type": "close_stream"}))
+
+        start_time = time.perf_counter()
+        ttft = None
+        sender = asyncio.create_task(send_audio())
+        transcript_parts = []
+
+        try:
+            async for message in ws:
+                try:
+                    output = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+
+                if not isinstance(output, dict):
+                    continue
+
+                if output.get("type") == "error" or output.get("error"):
+                    error = output.get("message") or output.get("error") or output
+                    raise RuntimeError(f"Smallest streaming STT error: {error}")
+
+                transcript = output.get("transcript", "")
+                if transcript and ttft is None:
+                    ttft = time.perf_counter() - start_time
+
+                if output.get("is_final") and transcript:
+                    transcript_parts.append(transcript)
+
+                if output.get("is_last"):
+                    break
+        finally:
+            if sender.done():
+                await sender
+            else:
+                sender.cancel()
+                try:
+                    await sender
+                except asyncio.CancelledError:
+                    pass
+
+    return {
+        "transcript": " ".join(
+            part.strip() for part in transcript_parts if part.strip()
+        ),
+        "ttft": ttft,
     }
 
 
@@ -498,7 +587,8 @@ async def transcribe_audio(
         "sarvam": transcribe_sarvam,
         "elevenlabs": transcribe_elevenlabs,
         "cartesia": transcribe_cartesia,
-        "smallest": transcribe_smallest,
+        # "smallest": transcribe_smallest,
+        "smallest": transcribe_smallest_streaming,
     }
 
     if provider not in provider_methods:
