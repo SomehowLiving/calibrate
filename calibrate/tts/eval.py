@@ -355,8 +355,9 @@ async def synthesize_sarvam(text: str, language: str, audio_path: str) -> Dict:
         await ws.flush()
         # print("Flushed buffer")
 
+        mp3_path = str(Path(audio_path).with_suffix(".mp3"))
         chunk_count = 0
-        with open(audio_path, "wb") as f:
+        with open(mp3_path, "wb") as f:
             async for message in ws:
                 if isinstance(message, AudioOutput):
                     if ttfb is None:
@@ -375,7 +376,8 @@ async def synthesize_sarvam(text: str, language: str, audio_path: str) -> Dict:
                     if message.data.event_type == "final":
                         break
 
-        # print(f"All {chunk_count} chunks saved to output.mp3")
+        convert_mp3_to_wav(mp3_path, audio_path)
+        # print(f"All {chunk_count} chunks saved to output.wav")
         _log("\033[93mAudio generation complete\033[0m")
         if hasattr(ws, "_websocket") and not ws._websocket.closed:
             await ws._websocket.close()
