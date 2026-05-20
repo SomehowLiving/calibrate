@@ -67,6 +67,7 @@ async def run(
         "telugu",
         "gujarati",
         "sindhi",
+        "maithili",
     ] = "english",
     input_file_name: str = "stt.csv",
     debug: bool = False,

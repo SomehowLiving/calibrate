@@ -837,6 +837,7 @@ STT_LANGUAGES = [
     "telugu",
     "gujarati",
     "sindhi",
+    "maithili",
 ]
 
 

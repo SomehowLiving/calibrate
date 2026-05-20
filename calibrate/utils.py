@@ -628,7 +628,8 @@ class MetricsLogger(FrameProcessor):
 # Language Code Utilities
 # =============================================================================
 
-# Sarvam supported language codes (Indian languages) - Same for STT and TTS
+# Sarvam supported language codes (Indian languages).
+# TTS and STT diverge: STT's saaras:v3 additionally supports Maithili.
 SARVAM_LANGUAGE_CODES = {
     "english": "en-IN",
     "hindi": "hi-IN",
@@ -642,6 +643,13 @@ SARVAM_LANGUAGE_CODES = {
     "telugu": "te-IN",
     "gujarati": "gu-IN",
 }
+
+SARVAM_STT_LANGUAGE_CODES = {
+    **SARVAM_LANGUAGE_CODES,
+    "maithili": "mai-IN",
+}
+
+SARVAM_TTS_LANGUAGE_CODES = SARVAM_LANGUAGE_CODES
 
 # Default language codes (ISO 639-1)
 DEFAULT_LANGUAGE_CODES = {
@@ -1268,7 +1276,7 @@ def get_stt_language_code(language: str, provider: str) -> str:
     language = language.lower()
 
     if provider == "sarvam":
-        return SARVAM_LANGUAGE_CODES.get(language, "en-IN")
+        return SARVAM_STT_LANGUAGE_CODES.get(language, "en-IN")
     elif provider == "google":
         return GOOGLE_STT_LANGUAGE_CODES.get(language, "en-US")
     elif provider == "smallest":
@@ -1309,7 +1317,7 @@ def get_tts_language_code(language: str, provider: str) -> str:
     language = language.lower()
 
     if provider == "sarvam":
-        return SARVAM_LANGUAGE_CODES.get(language, "en-IN")
+        return SARVAM_TTS_LANGUAGE_CODES.get(language, "en-IN")
     elif provider == "google":
         return GOOGLE_TTS_LANGUAGE_CODES.get(language, "en-US")
     elif provider == "smallest":
@@ -1357,7 +1365,7 @@ def validate_stt_language(language: str, provider: str) -> None:
 
     # Map providers to their STT language code dictionaries
     provider_languages = {
-        "sarvam": SARVAM_LANGUAGE_CODES,
+        "sarvam": SARVAM_STT_LANGUAGE_CODES,
         "google": GOOGLE_STT_LANGUAGE_CODES,
         "smallest": SMALLEST_STT_LANGUAGE_CODES,
         "cartesia": CARTESIA_STT_LANGUAGE_CODES,
@@ -1394,7 +1402,7 @@ def validate_tts_language(language: str, provider: str) -> None:
 
     # Map providers to their TTS language code dictionaries
     provider_languages = {
-        "sarvam": SARVAM_LANGUAGE_CODES,
+        "sarvam": SARVAM_TTS_LANGUAGE_CODES,
         "google": GOOGLE_TTS_LANGUAGE_CODES,
         "cartesia": CARTESIA_TTS_LANGUAGE_CODES,
         "elevenlabs": ELEVENLABS_TTS_LANGUAGE_CODES,

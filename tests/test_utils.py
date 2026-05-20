@@ -78,6 +78,23 @@ class TestLanguageCodes(unittest.TestCase):
 
         validate_tts_language("english", "google")
 
+    def test_sarvam_maithili_stt_only(self):
+        from calibrate.utils import (
+            get_stt_language_code,
+            get_tts_language_code,
+            validate_stt_language,
+            validate_tts_language,
+        )
+
+        self.assertEqual(get_stt_language_code("maithili", "sarvam"), "mai-IN")
+        validate_stt_language("maithili", "sarvam")
+
+        # Sarvam TTS does not support Maithili
+        with self.assertRaises(ValueError):
+            validate_tts_language("maithili", "sarvam")
+        # Unsupported TTS lookup falls back to default
+        self.assertEqual(get_tts_language_code("maithili", "sarvam"), "en-IN")
+
 
 class TestGetSTTLanguageEnum(unittest.TestCase):
     def test_sarvam_kannada(self):
